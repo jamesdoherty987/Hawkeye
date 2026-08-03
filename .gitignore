@@ -1,0 +1,25 @@
+# Python
+.venv/
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# YOLO / Ultralytics
+*.pt
+runs/
+weights/
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+
+# Captured data (keep folder structure, ignore images)
+dataset/**/raw/*.jpg
+dataset/**/raw/*.jpeg
+dataset/**/raw/*.png
+dataset/**/images/
+dataset/**/labels/
+!dataset/**/raw/.gitkeep
