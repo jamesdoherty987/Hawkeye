@@ -29,8 +29,8 @@ TARGET_CLASSES = {
     32: "sports ball",
 }
 
-FRAME_WIDTH = 640
-FRAME_HEIGHT = 480
+FRAME_WIDTH = 1280
+FRAME_HEIGHT = 720
 WINDOW_NAME = "Hawkeye Detect — Q quit"
 
 
@@ -110,6 +110,8 @@ def draw_filtered_detections(frame, results):
 def run_detection_loop(cap: cv2.VideoCapture, model: YOLO) -> None:
     """Read frames and run YOLO until Q is pressed."""
     print("Running. Press Q to quit.")
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WINDOW_NAME, 1280, 720)
 
     while True:
         ok, frame = cap.read()
@@ -127,7 +129,6 @@ def run_detection_loop(cap: cv2.VideoCapture, model: YOLO) -> None:
 
         display, _ = draw_filtered_detections(frame, results)
         cv2.imshow(WINDOW_NAME, display)
-
         key = cv2.waitKey(1) & 0xFF
         if key in (ord("q"), ord("Q")):
             break
