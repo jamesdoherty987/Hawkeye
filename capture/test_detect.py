@@ -24,7 +24,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MODEL_PATH = PROJECT_ROOT / "models" / "football_yolov8n.pt"
 OUTPUT_DIR = PROJECT_ROOT / "dataset" / "football" / "detections"
 IMAGE_SIZE = 320  # smaller = faster on Pi / Mac CPU
-CONFIDENCE = 0.35
+CONFIDENCE = 0.60  # higher = fewer false positives (heads/cups/lights); raise/lower as needed
 JPEG_QUALITY = 90
 
 FRAME_WIDTH = 1280
