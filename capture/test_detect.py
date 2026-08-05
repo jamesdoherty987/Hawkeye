@@ -24,7 +24,7 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MODEL_PATH = PROJECT_ROOT / "models" / "football_yolov8n.pt"
 OUTPUT_DIR = PROJECT_ROOT / "dataset" / "football" / "detections"
 IMAGE_SIZE = 640  # must match training (640); 320 misses the ball too often
-CONFIDENCE = 0.45  # with imgsz=640, real balls are usually ~0.5–0.85
+CONFIDENCE = 0.6  # with imgsz=640, real balls are usually ~0.5–0.85
 JPEG_QUALITY = 90
 
 FRAME_WIDTH = 1280
