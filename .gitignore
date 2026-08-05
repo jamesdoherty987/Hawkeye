@@ -22,4 +22,10 @@ dataset/**/raw/*.jpeg
 dataset/**/raw/*.png
 dataset/**/images/
 dataset/**/labels/
+dataset/**/videos/*.mp4
+dataset/**/*.zip
+dataset/**/yolo/train/
+dataset/**/yolo/valid/
+dataset/**/yolo/test/
 !dataset/**/raw/.gitkeep
+!dataset/**/yolo/data.yaml

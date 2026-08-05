@@ -45,12 +45,25 @@ If the wrong camera opens, change `CAMERA_INDEX` at the top of the script. If it
 
 - `capture/` — camera + detection scripts
 - `dataset/football/raw/` — images I capture
+- `dataset/football/videos/` — recorded clips
+- `dataset/football/yolo/` — labeled Roboflow export (train/valid)
 - `dataset/sliotar/` — for later
-- `training/` / `models/` / `exports/` — training output later
+- `training/` / `models/` / `exports/` — training output
+
+## Train custom football model
+
+Needs Python **3.11** venv with `requirements.txt` (not 3.14 — torch won't install).
+
+```bash
+python training/train_football.py
+```
+
+Best weights are copied to `models/football_yolov8n.pt`.
 
 ## Next steps
 
 1. Get live detect working on the Pi
-2. Collect ~500 of my own football images
-3. Label them and train a custom model
-4. Same again for sliotar
+2. Collect football images / videos
+3. Label in Roboflow, export YOLOv8 zip → `dataset/football/yolo/`
+4. Train custom model, then detect with those weights
+5. Same again for sliotar

@@ -1,0 +1,7 @@
+# Hawkeye football dataset (Roboflow YOLOv8 export)
+path: /Users/jamesdoherty/Projects/Hawkeye/dataset/football/yolo
+train: train/images
+val: valid/images
+
+nc: 1
+names: ['football']
