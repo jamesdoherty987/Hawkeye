@@ -2,7 +2,8 @@
 Live football detection with the custom trained model.
 
 Uses models/football_yolov8n.pt (trained on your labeled images).
-Falls back to note if the file is missing.
+When a ball is detected, saves that frame (with box drawn) to
+dataset/football/detections/.
 
 Q to quit.
 """
@@ -21,8 +22,10 @@ from ultralytics import YOLO
 CAMERA_INDEX = 0
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 MODEL_PATH = PROJECT_ROOT / "models" / "football_yolov8n.pt"
+OUTPUT_DIR = PROJECT_ROOT / "dataset" / "football" / "detections"
 IMAGE_SIZE = 320  # smaller = faster on Pi / Mac CPU
 CONFIDENCE = 0.35
+JPEG_QUALITY = 90
 
 FRAME_WIDTH = 1280
 FRAME_HEIGHT = 720
@@ -74,6 +77,37 @@ def load_model(model_path: Path = MODEL_PATH) -> YOLO:
         )
     print(f"Loading {model_path}...")
     return YOLO(str(model_path))
+
+
+def ensure_output_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def next_image_index(output_dir: Path) -> int:
+    existing = list(output_dir.glob("detect_*.jpg"))
+    if not existing:
+        return 1
+
+    indices = []
+    for file_path in existing:
+        parts = file_path.stem.rsplit("_", 1)
+        if len(parts) == 2 and parts[1].isdigit():
+            indices.append(int(parts[1]))
+
+    return (max(indices) + 1) if indices else 1
+
+
+def save_detection_frame(frame, output_dir: Path, index: int) -> Path | None:
+    output_path = output_dir / f"detect_{index:06d}.jpg"
+    ok = cv2.imwrite(
+        str(output_path),
+        frame,
+        [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY],
+    )
+    if not ok:
+        print(f"Failed to save {output_path}", file=sys.stderr)
+        return None
+    return output_path
 
 
 def draw_detections(frame, results):
@@ -131,7 +165,13 @@ def draw_detections(frame, results):
     return display, count
 
 
-def run_detection_loop(cap: cv2.VideoCapture, model: YOLO) -> None:
+def run_detection_loop(cap: cv2.VideoCapture, model: YOLO) -> int:
+    ensure_output_dir(OUTPUT_DIR)
+    next_index = next_image_index(OUTPUT_DIR)
+    saved_count = 0
+
+    print(f"Saving detections to: {OUTPUT_DIR}")
+    print(f"Starting at: detect_{next_index:06d}.jpg")
     print("Running custom football model. Press Q to quit.")
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WINDOW_NAME, 1280, 720)
@@ -149,11 +189,30 @@ def run_detection_loop(cap: cv2.VideoCapture, model: YOLO) -> None:
             verbose=False,
         )
 
-        display, _ = draw_detections(frame, results)
+        display, ball_count = draw_detections(frame, results)
+
+        if ball_count > 0:
+            path = save_detection_frame(display, OUTPUT_DIR, next_index)
+            if path is not None:
+                next_index += 1
+                saved_count += 1
+                cv2.putText(
+                    display,
+                    f"Saved: {saved_count}",
+                    (10, 56),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.7,
+                    (0, 255, 0),
+                    2,
+                    cv2.LINE_AA,
+                )
+
         cv2.imshow(WINDOW_NAME, display)
         key = cv2.waitKey(1) & 0xFF
         if key in (ord("q"), ord("Q")):
             break
+
+    return saved_count
 
 
 def main() -> int:
@@ -161,7 +220,8 @@ def main() -> int:
     try:
         model = load_model(MODEL_PATH)
         cap = open_camera(CAMERA_INDEX)
-        run_detection_loop(cap, model)
+        saved = run_detection_loop(cap, model)
+        print(f"Done. Saved {saved} detection frame(s).")
         return 0
     except RuntimeError as exc:
         print(str(exc), file=sys.stderr)

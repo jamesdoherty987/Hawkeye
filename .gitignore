@@ -20,6 +20,9 @@ weights/
 dataset/**/raw/*.jpg
 dataset/**/raw/*.jpeg
 dataset/**/raw/*.png
+dataset/**/detections/*.jpg
+dataset/**/detections/*.jpeg
+dataset/**/detections/*.png
 dataset/**/images/
 dataset/**/labels/
 dataset/**/videos/*.mp4

@@ -9,6 +9,7 @@ Q = quit
 
 from __future__ import annotations
 
+import platform
 import sys
 from pathlib import Path
 
@@ -50,23 +51,42 @@ def build_image_path(output_dir: Path, class_name: str, index: int) -> Path:
     return output_dir / f"{class_name}_{index:06d}.jpg"
 
 
+def camera_backends() -> list[tuple[str, int]]:
+    system = platform.system()
+    if system == "Darwin":
+        return [("AVFoundation", cv2.CAP_AVFOUNDATION), ("default", cv2.CAP_ANY)]
+    if system == "Linux":
+        return [("V4L2", cv2.CAP_V4L2), ("default", cv2.CAP_ANY)]
+    return [
+        ("MSMF", cv2.CAP_MSMF),
+        ("DirectShow", cv2.CAP_DSHOW),
+        ("default", cv2.CAP_ANY),
+    ]
+
+
 def open_camera(index: int = CAMERA_INDEX) -> cv2.VideoCapture:
-    """Open the USB camera. Tries V4L2 first (works on the Pi)."""
-    cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
-    if not cap.isOpened():
-        cap = cv2.VideoCapture(index)
+    """Open the USB camera with the right backend for this OS."""
+    for name, backend in camera_backends():
+        cap = cv2.VideoCapture(index, backend)
+        if not cap.isOpened():
+            cap.release()
+            continue
 
-    if not cap.isOpened():
-        raise RuntimeError(
-            f"Couldn't open camera {index}. Check the cable or try another CAMERA_INDEX."
-        )
+        if FRAME_WIDTH is not None:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+        if FRAME_HEIGHT is not None:
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
 
-    if FRAME_WIDTH is not None:
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
-    if FRAME_HEIGHT is not None:
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+        ok, frame = cap.read()
+        if ok and frame is not None:
+            print(f"Camera {index} opened via {name}.")
+            return cap
 
-    return cap
+        cap.release()
+
+    raise RuntimeError(
+        f"Couldn't open camera {index}. Check the cable or try another CAMERA_INDEX."
+    )
 
 
 def save_frame(frame, output_path: Path) -> bool:

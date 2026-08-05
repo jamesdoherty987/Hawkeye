@@ -1,69 +1,98 @@
 # Hawkeye
 
-Final year project stuff — detecting a football (and later a sliotar) with a Raspberry Pi 4 and an Arducam UC-844 USB camera.
+Final year project — detecting a football (and later a sliotar) with a camera + YOLOv8.
 
-Using OpenCV for the camera (USB, so not Picamera2) and YOLOv8 for detection.
+Works with an Arducam UC-844 USB camera on Mac, Windows, or Raspberry Pi (OpenCV, not Picamera2).
 
-## Setup (Pi)
+## Setup
+
+Use **Python 3.11** (3.14 cannot install the pinned torch build).
 
 ```bash
 git clone https://github.com/jamesdoherty987/Hawkeye.git
 cd Hawkeye
-python3 -m venv .venv
-source .venv/bin/activate
+python3.11 -m venv .venv
+source .venv/bin/activate          # Windows: .venv\Scripts\activate
 pip install -r requirements.txt
 ```
 
-Might also need:
+On Pi you might also need:
 
 ```bash
 sudo apt install -y python3-venv python3-pip libgl1 libglib2.0-0
 ```
 
+Copy `models/football_yolov8n.pt` onto the machine if you already trained (do not retrain just to move).
+
 ## Scripts
 
-**Test the camera / save training images**
+**Record video (pitch / outdoor)**
+
+```bash
+python capture/record_video.py
+```
+
+- R = start/stop recording → `dataset/football/videos/`
+- Q = quit
+- Exposure auto-adjusts from scene brightness
+
+**Review a video and save ball frames by hand**
+
+```bash
+python capture/review_video.py dataset/football/videos/football_000003.mp4
+```
+
+- SPACE = save frame → `dataset/football/raw/`
+- A / D = back / forward 3 seconds
+- P = pause | Q = quit
+
+**Auto-extract every Nth frame from all videos**
+
+```bash
+python capture/extract_frames.py
+python capture/extract_frames.py --every 8
+```
+
+**Still capture (SPACE to save)**
 
 ```bash
 python capture/capture_images.py
 ```
 
-- SPACE = save frame → `dataset/football/raw/football_000001.jpg` etc.
-- Q = quit
-
-**Live detection (pretrained COCO model — person + sports ball)**
+**Live detect with your trained model**
 
 ```bash
 python capture/test_detect.py
 ```
 
-First run downloads `yolov8n.pt`. Stand in front of the camera with a football. Q to quit.
+- Loads `models/football_yolov8n.pt`
+- Draws a box on the ball
+- Saves every frame with a ball to `dataset/football/detections/`
+- Q = quit
 
-If the wrong camera opens, change `CAMERA_INDEX` at the top of the script. If it's slow on the Pi, lower `IMAGE_SIZE` in `test_detect.py`.
+If the wrong camera opens, change `CAMERA_INDEX` at the top of the script.
 
-## Folders
-
-- `capture/` — camera + detection scripts
-- `dataset/football/raw/` — images I capture
-- `dataset/football/videos/` — recorded clips
-- `dataset/football/yolo/` — labeled Roboflow export (train/valid)
-- `dataset/sliotar/` — for later
-- `training/` / `models/` / `exports/` — training output
-
-## Train custom football model
-
-Needs Python **3.11** venv with `requirements.txt` (not 3.14 — torch won't install).
+**Train (after Roboflow YOLOv8 export is in `dataset/football/yolo/`)**
 
 ```bash
 python training/train_football.py
 ```
 
-Best weights are copied to `models/football_yolov8n.pt`.
+Best weights → `models/football_yolov8n.pt`
+
+## Folders
+
+- `capture/` — camera + detection scripts
+- `dataset/football/raw/` — hand-picked / extracted stills
+- `dataset/football/videos/` — recorded clips
+- `dataset/football/yolo/` — labeled Roboflow export (train/valid)
+- `dataset/football/detections/` — frames saved when live detect sees a ball
+- `dataset/sliotar/` — for later
+- `training/` / `models/` / `exports/` — training output
 
 ## Next steps
 
-1. Get live detect working on the Pi
-2. Collect football images / videos
-3. Label in Roboflow, export YOLOv8 zip → `dataset/football/yolo/`
-4. Train custom model, then detect with those weights
-5. Same again for sliotar
+1. Collect more varied football footage if needed
+2. Add some no-ball images if you get false positives, then retrain
+3. Same pipeline for sliotar
+4. Later: tracking / multi-camera / faster hardware if needed
