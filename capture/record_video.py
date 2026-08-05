@@ -9,6 +9,7 @@ Q = quit
 
 from __future__ import annotations
 
+import platform
 import sys
 import time
 from pathlib import Path
@@ -25,6 +26,8 @@ FRAME_WIDTH = 1280
 FRAME_HEIGHT = 720
 VIDEO_CODEC = "mp4v"  # works on Windows; use "avc1" if playback looks wrong
 WINDOW_NAME = "Hawkeye Record — R record | Q quit"
+READ_RETRIES = 30  # USB cams on Mac often drop a few frames; don't quit immediately
+WARMUP_FRAMES = 10
 
 
 def ensure_output_dir(path: Path) -> None:
@@ -50,30 +53,62 @@ def build_video_path(output_dir: Path, class_name: str, index: int) -> Path:
     return output_dir / f"{class_name}_{index:06d}.mp4"
 
 
-def open_camera(index: int = CAMERA_INDEX) -> cv2.VideoCapture:
-    """Open the USB camera. Tries V4L2 first (Pi), then default backend."""
-    cap = cv2.VideoCapture(index, cv2.CAP_V4L2)
-    if not cap.isOpened():
-        cap = cv2.VideoCapture(index)
+def camera_backends() -> list[tuple[str, int]]:
+    """Pick OpenCV backends that match the OS."""
+    system = platform.system()
+    if system == "Darwin":
+        return [("AVFoundation", cv2.CAP_AVFOUNDATION), ("default", cv2.CAP_ANY)]
+    if system == "Linux":
+        return [("V4L2", cv2.CAP_V4L2), ("default", cv2.CAP_ANY)]
+    # Windows
+    return [("DirectShow", cv2.CAP_DSHOW), ("default", cv2.CAP_ANY)]
 
-    if not cap.isOpened():
-        raise RuntimeError(
-            f"Couldn't open camera {index}. Check the cable or try another CAMERA_INDEX."
+
+def open_camera(index: int = CAMERA_INDEX) -> cv2.VideoCapture:
+    """Open the USB camera with the right backend for this OS."""
+    last_error = f"Couldn't open camera {index}."
+
+    for name, backend in camera_backends():
+        print(f"Trying camera {index} via {name}...")
+        cap = cv2.VideoCapture(index, backend)
+        if not cap.isOpened():
+            cap.release()
+            continue
+
+        if FRAME_WIDTH is not None:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
+        if FRAME_HEIGHT is not None:
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+
+        # Keep the buffer small so we don't lag behind on USB cams.
+        try:
+            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:
+            pass
+
+        ok, frame = read_frame(cap, retries=WARMUP_FRAMES)
+        if ok and frame is not None:
+            print(f"Camera {index} opened via {name}.")
+            return cap
+
+        cap.release()
+        last_error = (
+            f"Camera {index} opened via {name} but no frames came through. "
+            "Close Zoom/FaceTime/browser tabs using the camera, unplug/replug the "
+            "Arducam, then try again. If it still fails, change CAMERA_INDEX."
         )
 
-    if FRAME_WIDTH is not None:
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
-    if FRAME_HEIGHT is not None:
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
-
-    return cap
+    raise RuntimeError(last_error)
 
 
-def camera_fps(cap: cv2.VideoCapture) -> float:
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if fps is None or fps <= 1 or fps > 120:
-        return 30.0
-    return float(fps)
+def read_frame(cap: cv2.VideoCapture, retries: int = READ_RETRIES):
+    """Read a frame, retrying through short USB / Mac dropouts."""
+    for _ in range(max(retries, 1)):
+        ok, frame = cap.read()
+        if ok and frame is not None:
+            return True, frame
+        time.sleep(0.02)
+    return False, None
 
 
 def create_writer(path: Path, frame_width: int, frame_height: int, fps: float) -> cv2.VideoWriter:
@@ -82,6 +117,32 @@ def create_writer(path: Path, frame_width: int, frame_height: int, fps: float) -
     if not writer.isOpened():
         raise RuntimeError(f"Couldn't create video writer for {path}")
     return writer
+
+
+def rewrite_with_fps(path: Path, fps: float) -> None:
+    """
+    Re-save the clip using the real capture rate.
+
+    OpenCV VideoWriter needs an FPS up front, but camera CAP_PROP_FPS is often
+    wrong (e.g. 30) while the preview loop only actually grabs ~5–10 fps.
+    That mismatch makes playback look sped up.
+    """
+    temp_path = path.with_name(f"{path.stem}_tmp{path.suffix}")
+    reader = cv2.VideoCapture(str(path))
+    ok, frame = reader.read()
+    if not ok or frame is None:
+        reader.release()
+        return
+
+    height, width = frame.shape[:2]
+    writer = create_writer(temp_path, width, height, fps)
+    while ok and frame is not None:
+        writer.write(frame)
+        ok, frame = reader.read()
+
+    reader.release()
+    writer.release()
+    temp_path.replace(path)
 
 
 def format_duration(seconds: float) -> str:
@@ -133,15 +194,19 @@ def run_record_loop(cap: cv2.VideoCapture, output_dir: Path, class_name: str) ->
     next_index = next_video_index(output_dir, class_name)
     saved_clips = 0
 
-    ok, first_frame = cap.read()
+    ok, first_frame = read_frame(cap)
     if not ok or first_frame is None:
-        raise RuntimeError("Couldn't read from camera.")
+        raise RuntimeError(
+            "Couldn't read from camera. Close other apps using it, "
+            "unplug/replug the cable, then try again."
+        )
 
     frame_height, frame_width = first_frame.shape[:2]
-    fps = camera_fps(cap)
+    # Placeholder only — real FPS is measured when the clip stops.
+    writer_fps_placeholder = 30.0
 
     print(f"Saving to: {output_dir}")
-    print(f"Resolution: {frame_width}x{frame_height} @ {fps:.1f} fps")
+    print(f"Resolution: {frame_width}x{frame_height}")
     print(f"Next file: {class_name}_{next_index:06d}.mp4")
     print("Press R to start/stop recording, Q to quit.")
 
@@ -154,17 +219,22 @@ def run_record_loop(cap: cv2.VideoCapture, output_dir: Path, class_name: str) ->
     def stop_recording() -> None:
         nonlocal recording, writer, current_path, clip_start, clip_frames, saved_clips, next_index
 
-        if not recording or writer is None:
+        if not recording or writer is None or current_path is None:
             return
 
         writer.release()
         writer = None
         recording = False
-        duration = time.monotonic() - clip_start
+        duration = max(time.monotonic() - clip_start, 1e-6)
+        measured_fps = max(clip_frames / duration, 1.0)
+
+        print(f"Fixing playback speed ({measured_fps:.1f} fps)...")
+        rewrite_with_fps(current_path, measured_fps)
+
         saved_clips += 1
         print(
             f"Saved {current_path.name} "
-            f"({clip_frames} frames, {format_duration(duration)})"
+            f"({clip_frames} frames, {format_duration(duration)}, {measured_fps:.1f} fps)"
         )
         next_index += 1
         current_path = None
@@ -174,7 +244,9 @@ def run_record_loop(cap: cv2.VideoCapture, output_dir: Path, class_name: str) ->
         nonlocal recording, writer, current_path, clip_start, clip_frames, next_index
 
         current_path = build_video_path(output_dir, class_name, next_index)
-        writer = create_writer(current_path, frame_width, frame_height, fps)
+        writer = create_writer(
+            current_path, frame_width, frame_height, writer_fps_placeholder
+        )
         recording = True
         clip_start = time.monotonic()
         clip_frames = 0
@@ -203,12 +275,16 @@ def run_record_loop(cap: cv2.VideoCapture, output_dir: Path, class_name: str) ->
                 stop_recording()
             break
 
-        ok, frame = cap.read()
-        if not ok or frame is None:
-            print("Couldn't read from camera.", file=sys.stderr)
+        ok, next_frame = read_frame(cap)
+        if not ok or next_frame is None:
+            print(
+                "Lost camera feed. Close other camera apps, unplug/replug, then retry.",
+                file=sys.stderr,
+            )
             if recording:
                 stop_recording()
             break
+        frame = next_frame
 
     if writer is not None:
         writer.release()
