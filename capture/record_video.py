@@ -3,6 +3,8 @@ Record video from the USB camera for the dataset.
 
 Arducam UC-844 is USB so this uses OpenCV VideoCapture (works on Windows + Pi).
 
+Exposure adjusts automatically from the scene brightness — no keys needed for that.
+
 R = start / stop recording (each stop saves a new file)
 Q = quit
 """
@@ -15,6 +17,7 @@ import time
 from pathlib import Path
 
 import cv2
+import numpy as np
 
 
 # --- settings ---
@@ -28,6 +31,22 @@ VIDEO_CODEC = "mp4v"  # works on Windows; use "avc1" if playback looks wrong
 WINDOW_NAME = "Hawkeye Record — R record | Q quit"
 READ_RETRIES = 30  # USB cams on Mac often drop a few frames; don't quit immediately
 WARMUP_FRAMES = 10
+
+# Software auto-exposure: keep average brightness near the target.
+TARGET_BRIGHTNESS = 120.0  # 0–255; ~110–140 looks normal outdoors
+BRIGHTNESS_TOLERANCE = 15.0
+# Typical Windows/Mac UVC exposure range is about -13 (dark) to -1 (bright).
+MIN_EXPOSURE = -13.0
+MAX_EXPOSURE = -1.0
+DEFAULT_EXPOSURE = -8.0
+EXPOSURE_STEP = 1.0
+GAIN_MIN = 0.0
+GAIN_MAX = 64.0
+DEFAULT_GAIN = 0.0
+GAIN_STEP = 2.0
+# Don't twitch every frame — adjust every N frames once settled.
+AE_EVERY_N_FRAMES = 5
+AE_SETTLE_LOOPS = 25
 
 
 def ensure_output_dir(path: Path) -> None:
@@ -60,8 +79,114 @@ def camera_backends() -> list[tuple[str, int]]:
         return [("AVFoundation", cv2.CAP_AVFOUNDATION), ("default", cv2.CAP_ANY)]
     if system == "Linux":
         return [("V4L2", cv2.CAP_V4L2), ("default", cv2.CAP_ANY)]
-    # Windows
-    return [("DirectShow", cv2.CAP_DSHOW), ("default", cv2.CAP_ANY)]
+    # Windows — MSMF is better for Arducam exposure controls; DSHOW as fallback.
+    return [
+        ("MSMF", cv2.CAP_MSMF),
+        ("DirectShow", cv2.CAP_DSHOW),
+        ("default", cv2.CAP_ANY),
+    ]
+
+
+def try_set(cap: cv2.VideoCapture, prop: int, value: float) -> bool:
+    try:
+        return bool(cap.set(prop, value))
+    except Exception:
+        return False
+
+
+def read_frame(cap: cv2.VideoCapture, retries: int = READ_RETRIES):
+    """Read a frame, retrying through short USB / Mac dropouts."""
+    for _ in range(max(retries, 1)):
+        ok, frame = cap.read()
+        if ok and frame is not None:
+            return True, frame
+        time.sleep(0.02)
+    return False, None
+
+
+def force_manual_exposure_mode(cap: cv2.VideoCapture) -> None:
+    """
+    Turn off the camera's own AE so our software loop can drive exposure.
+
+    UVC drivers disagree on the flag value for "manual".
+    """
+    for value in (0.25, 1.0, 0.0):
+        if try_set(cap, cv2.CAP_PROP_AUTO_EXPOSURE, value):
+            break
+    try_set(cap, cv2.CAP_PROP_AUTO_WB, 1)
+
+
+def frame_brightness(frame) -> float:
+    """Mean brightness of the centre of the frame (0–255)."""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    h, w = gray.shape
+    y0, y1 = h // 4, 3 * h // 4
+    x0, x1 = w // 4, 3 * w // 4
+    return float(np.mean(gray[y0:y1, x0:x1]))
+
+
+class SoftwareAutoExposure:
+    """
+    Continuously nudge camera exposure/gain toward a sensible brightness.
+
+    Hardware auto-exposure often fails outdoors (white sky / stuck AE).
+    This measures the frame and adjusts without any user input.
+    """
+
+    def __init__(self, cap: cv2.VideoCapture) -> None:
+        self.cap = cap
+        self.exposure = DEFAULT_EXPOSURE
+        self.gain = DEFAULT_GAIN
+        self.frame_count = 0
+        self.last_brightness = 0.0
+        force_manual_exposure_mode(cap)
+        try_set(cap, cv2.CAP_PROP_EXPOSURE, self.exposure)
+        try_set(cap, cv2.CAP_PROP_GAIN, self.gain)
+
+    def status_text(self) -> str:
+        return (
+            f"AutoExp brightness={self.last_brightness:.0f} "
+            f"exp={self.exposure:.0f} gain={self.gain:.0f}"
+        )
+
+    def update(self, frame, force: bool = False) -> None:
+        self.frame_count += 1
+        if not force and self.frame_count % AE_EVERY_N_FRAMES != 0:
+            return
+
+        brightness = frame_brightness(frame)
+        self.last_brightness = brightness
+        error = brightness - TARGET_BRIGHTNESS
+
+        if abs(error) <= BRIGHTNESS_TOLERANCE:
+            return
+
+        # Too bright → lower exposure first, then gain.
+        # Too dark → raise gain a little, then exposure.
+        if error > 0:
+            if self.exposure > MIN_EXPOSURE:
+                self.exposure = max(MIN_EXPOSURE, self.exposure - EXPOSURE_STEP)
+                try_set(self.cap, cv2.CAP_PROP_EXPOSURE, self.exposure)
+            elif self.gain > GAIN_MIN:
+                self.gain = max(GAIN_MIN, self.gain - GAIN_STEP)
+                try_set(self.cap, cv2.CAP_PROP_GAIN, self.gain)
+        else:
+            if self.exposure < MAX_EXPOSURE:
+                self.exposure = min(MAX_EXPOSURE, self.exposure + EXPOSURE_STEP)
+                try_set(self.cap, cv2.CAP_PROP_EXPOSURE, self.exposure)
+            elif self.gain < GAIN_MAX:
+                self.gain = min(GAIN_MAX, self.gain + GAIN_STEP)
+                try_set(self.cap, cv2.CAP_PROP_GAIN, self.gain)
+
+    def settle(self) -> None:
+        """Run a short loop so outdoor light is corrected before you hit Record."""
+        print("Auto-adjusting exposure to the scene...")
+        for _ in range(AE_SETTLE_LOOPS):
+            ok, frame = read_frame(self.cap, retries=5)
+            if not ok or frame is None:
+                continue
+            self.update(frame, force=True)
+        print(f"Exposure ready: {self.status_text()}")
 
 
 def open_camera(index: int = CAMERA_INDEX) -> cv2.VideoCapture:
@@ -80,11 +205,7 @@ def open_camera(index: int = CAMERA_INDEX) -> cv2.VideoCapture:
         if FRAME_HEIGHT is not None:
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
 
-        # Keep the buffer small so we don't lag behind on USB cams.
-        try:
-            cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-        except Exception:
-            pass
+        try_set(cap, cv2.CAP_PROP_BUFFERSIZE, 1)
 
         ok, frame = read_frame(cap, retries=WARMUP_FRAMES)
         if ok and frame is not None:
@@ -99,16 +220,6 @@ def open_camera(index: int = CAMERA_INDEX) -> cv2.VideoCapture:
         )
 
     raise RuntimeError(last_error)
-
-
-def read_frame(cap: cv2.VideoCapture, retries: int = READ_RETRIES):
-    """Read a frame, retrying through short USB / Mac dropouts."""
-    for _ in range(max(retries, 1)):
-        ok, frame = cap.read()
-        if ok and frame is not None:
-            return True, frame
-        time.sleep(0.02)
-    return False, None
 
 
 def create_writer(path: Path, frame_width: int, frame_height: int, fps: float) -> cv2.VideoWriter:
@@ -156,6 +267,7 @@ def draw_overlay(
     clip_seconds: float,
     saved_clips: int,
     class_name: str,
+    exposure_text: str,
 ):
     display = frame.copy()
     status = "REC" if recording else "READY"
@@ -166,6 +278,7 @@ def draw_overlay(
         f"Status: {status}",
         f"Clip time: {format_duration(clip_seconds)}",
         f"Saved this session: {saved_clips}",
+        exposure_text,
         "R = start/stop | Q = quit",
     ]
 
@@ -176,12 +289,12 @@ def draw_overlay(
             line,
             (10, y),
             cv2.FONT_HERSHEY_SIMPLEX,
-            0.7,
+            0.6,
             colour,
             2,
             cv2.LINE_AA,
         )
-        y += 28
+        y += 26
 
     if recording:
         cv2.circle(display, (display.shape[1] - 30, 30), 10, (0, 0, 255), -1)
@@ -194,6 +307,9 @@ def run_record_loop(cap: cv2.VideoCapture, output_dir: Path, class_name: str) ->
     next_index = next_video_index(output_dir, class_name)
     saved_clips = 0
 
+    auto_exp = SoftwareAutoExposure(cap)
+    auto_exp.settle()
+
     ok, first_frame = read_frame(cap)
     if not ok or first_frame is None:
         raise RuntimeError(
@@ -202,13 +318,12 @@ def run_record_loop(cap: cv2.VideoCapture, output_dir: Path, class_name: str) ->
         )
 
     frame_height, frame_width = first_frame.shape[:2]
-    # Placeholder only — real FPS is measured when the clip stops.
     writer_fps_placeholder = 30.0
 
     print(f"Saving to: {output_dir}")
     print(f"Resolution: {frame_width}x{frame_height}")
     print(f"Next file: {class_name}_{next_index:06d}.mp4")
-    print("Press R to start/stop recording, Q to quit.")
+    print("Exposure adjusts automatically. Press R to record, Q to quit.")
 
     recording = False
     writer: cv2.VideoWriter | None = None
@@ -255,12 +370,21 @@ def run_record_loop(cap: cv2.VideoCapture, output_dir: Path, class_name: str) ->
     frame = first_frame
 
     while True:
+        auto_exp.update(frame)
+
         if recording and writer is not None:
             writer.write(frame)
             clip_frames += 1
 
         clip_seconds = time.monotonic() - clip_start if recording else 0.0
-        display = draw_overlay(frame, recording, clip_seconds, saved_clips, class_name)
+        display = draw_overlay(
+            frame,
+            recording,
+            clip_seconds,
+            saved_clips,
+            class_name,
+            auto_exp.status_text(),
+        )
         cv2.imshow(WINDOW_NAME, display)
 
         key = cv2.waitKey(1) & 0xFF
