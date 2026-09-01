@@ -23,3 +23,4 @@ dataset/**/raw/*.png
 dataset/**/images/
 dataset/**/labels/
 !dataset/**/raw/.gitkeep
+dataset\football\videos

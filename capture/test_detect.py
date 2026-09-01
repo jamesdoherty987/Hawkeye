@@ -18,7 +18,7 @@ from ultralytics import YOLO
 
 
 # --- settings ---
-CAMERA_INDEX = 0
+CAMERA_INDEX = 1
 MODEL_NAME = "yolov8n.pt"
 IMAGE_SIZE = 320  # smaller = faster on Pi
 CONFIDENCE = 0.35

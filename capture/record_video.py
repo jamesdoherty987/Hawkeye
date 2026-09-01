@@ -24,7 +24,7 @@ import numpy as np
 CLASS_NAME = "football"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_DIR = PROJECT_ROOT / "dataset" / CLASS_NAME / "videos"
-CAMERA_INDEX = 0
+CAMERA_INDEX = 1
 FRAME_WIDTH = 1280
 FRAME_HEIGHT = 720
 VIDEO_CODEC = "mp4v"  # works on Windows; use "avc1" if playback looks wrong
