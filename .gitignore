@@ -31,4 +31,6 @@ dataset/**/yolo/train/
 dataset/**/yolo/valid/
 dataset/**/yolo/test/
 !dataset/**/raw/.gitkeep
-!dataset/**/yolo/data.yaml
+exports/**/*.mp4
+exports/**/*.csv
+!exports/**/.gitkeep

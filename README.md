@@ -70,7 +70,17 @@ python capture/test_detect.py
 - Saves every frame with a ball to `dataset/football/detections/`
 - Q = quit
 
-If the wrong camera opens, change `CAMERA_INDEX` at the top of the script.
+**Detect + track path (Phase 1 — single camera)**
+
+```bash
+python capture/track_video.py dataset/football/videos/football_000003.mp4
+python capture/track_video.py dataset/football/videos/football_000003.mp4 --save-video
+python capture/track_video.py --camera
+```
+
+Uses **YOLO + ByteTrack** (built into Ultralytics). Draws a trail, speed (px/s), and direction. Saves path CSV to `exports/football/paths/`. Annotated video (optional) → `exports/football/tracked/`.
+
+If the wrong camera opens, use `--camera-index 1` (track) or change `CAMERA_INDEX` in `test_detect.py`.
 
 **Train (after Roboflow YOLOv8 export is in `dataset/football/yolo/`)**
 
@@ -87,12 +97,27 @@ Best weights → `models/football_yolov8n.pt`
 - `dataset/football/videos/` — recorded clips
 - `dataset/football/yolo/` — labeled Roboflow export (train/valid)
 - `dataset/football/detections/` — frames saved when live detect sees a ball
+- `exports/football/tracked/` — annotated videos with ball trail
+- `exports/football/paths/` — CSV path data (frame, time, x, y)
 - `dataset/sliotar/` — for later
 - `training/` / `models/` / `exports/` — training output
 
+## Data collection (what goes where)
+
+| Goal | What to collect | Where it goes | Then |
+|------|-----------------|---------------|------|
+| **Train detector** | Ball in frame (still + moving) | `dataset/football/raw/` via review/capture | Label in Roboflow → export to `dataset/football/yolo/` → retrain |
+| **Hard negatives** | Heads, cups, empty pitch — **no box** | Same Roboflow project, upload, leave unlabeled | Retrain — reduces false positives |
+| **Test tracking** | Clips with ball crossing the frame | `dataset/football/videos/` | Run `track_video.py` on them |
+| **More moving ball** | Kicks, rolls, far + close | Record → review video → save key frames **and** keep full videos for tracking | Both labeling and `track_video.py` |
+
+You do **not** need 1000 images. Aim for ~200–400 labeled ball images + ~50–100 negatives, plus a few good pitch videos for tracking tests.
+
+Tracking quality depends on detection — improve the model first if the trail keeps breaking.
+
 ## Next steps
 
-1. Collect more varied football footage if needed
-2. Add some no-ball images if you get false positives, then retrain
-3. Same pipeline for sliotar
-4. Later: tracking / multi-camera / faster hardware if needed
+1. Improve dataset (negatives + varied ball shots) and retrain
+2. Run `track_video.py` on your pitch videos; tune `CONFIDENCE` in `track_video.py`
+3. Same pipeline for sliotar later
+4. Phase 2: camera calibration + ground plane; Phase 3: second camera + 3D
