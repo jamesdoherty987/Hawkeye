@@ -17,6 +17,8 @@ from pathlib import Path
 import cv2
 from ultralytics import YOLO
 
+from auto_exposure import SoftwareAutoExposure, read_frame, try_set
+
 
 # --- settings ---
 CAMERA_INDEX = 1  # use 0 on the other laptop if needed
@@ -56,8 +58,9 @@ def open_camera(index: int = CAMERA_INDEX) -> cv2.VideoCapture:
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
         if FRAME_HEIGHT is not None:
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+        try_set(cap, cv2.CAP_PROP_BUFFERSIZE, 1)
 
-        ok, frame = cap.read()
+        ok, frame = read_frame(cap, retries=10)
         if ok and frame is not None:
             print(f"Camera {index} opened via {name}.")
             return cap
@@ -170,14 +173,17 @@ def run_detection_loop(cap: cv2.VideoCapture, model: YOLO) -> int:
     next_index = next_image_index(OUTPUT_DIR)
     saved_count = 0
 
+    auto_exp = SoftwareAutoExposure(cap)
+    auto_exp.settle()
+
     print(f"Saving detections to: {OUTPUT_DIR}")
     print(f"Starting at: detect_{next_index:06d}.jpg")
-    print("Running custom football model. Press Q to quit.")
+    print("Running custom football model (sky auto-exposure locked). Press Q to quit.")
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WINDOW_NAME, 1280, 720)
 
     while True:
-        ok, frame = cap.read()
+        ok, frame = read_frame(cap)
         if not ok or frame is None:
             print("Couldn't read from camera.", file=sys.stderr)
             break
@@ -190,6 +196,16 @@ def run_detection_loop(cap: cv2.VideoCapture, model: YOLO) -> int:
         )
 
         display, ball_count = draw_detections(frame, results)
+        cv2.putText(
+            display,
+            auto_exp.status_text(),
+            (10, 84),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (200, 200, 200),
+            1,
+            cv2.LINE_AA,
+        )
 
         if ball_count > 0:
             path = save_detection_frame(display, OUTPUT_DIR, next_index)

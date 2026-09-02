@@ -27,6 +27,9 @@ from pathlib import Path
 import cv2
 from ultralytics import YOLO
 
+from auto_exposure import SoftwareAutoExposure, read_frame, try_set
+from ball_kalman import BallKalman
+
 
 # --- settings ---
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -35,9 +38,11 @@ EXPORT_VIDEO_DIR = PROJECT_ROOT / "exports" / "football" / "tracked"
 EXPORT_PATH_DIR = PROJECT_ROOT / "exports" / "football" / "paths"
 
 IMAGE_SIZE = 640
-CONFIDENCE = 0.45  # tracking needs detections often; slightly lower than live-only
+CONFIDENCE = 0.4  # tracking needs detections often; slightly lower than live-only
 TRACKER = "bytetrack.yaml"  # fast default; try "botsort.yaml" if track drops on blur
 TRAIL_LENGTH = 60  # max points drawn on trail
+KALMAN_SEARCH_RADIUS = 120.0  # base px window around predicted ball position
+KALMAN_MAX_MISSES = 8  # reset prediction after this many frames without a detection
 FRAME_WIDTH = 1280
 FRAME_HEIGHT = 720
 WINDOW_NAME = "Hawkeye Track — Q quit"
@@ -66,7 +71,8 @@ def open_camera(index: int = 0) -> cv2.VideoCapture:
             cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
         if FRAME_HEIGHT is not None:
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
-        ok, frame = cap.read()
+        try_set(cap, cv2.CAP_PROP_BUFFERSIZE, 1)
+        ok, frame = read_frame(cap, retries=10)
         if ok and frame is not None:
             print(f"Camera {index} opened via {name}.")
             return cap
@@ -139,13 +145,20 @@ def load_model() -> YOLO:
     return YOLO(str(MODEL_PATH))
 
 
-def pick_ball_box(boxes) -> tuple[int, float, float, float, float, float] | None:
+def pick_ball_box(
+    boxes,
+    prediction: tuple[float, float] | None = None,
+    search_radius: float = KALMAN_SEARCH_RADIUS,
+) -> tuple[int, float, float, float, float, float, float] | None:
     """
     Choose one ball box from tracker output.
-    Returns (track_id, cx, cy, x1, y1, x2, y2) or None.
+
+    When prediction is set, prefer detections inside the search window near the
+    Kalman-predicted position (helps fast sky crossings and rejects stray boxes).
+
+    Returns (track_id, cx, cy, x1, y1, x2, y2, conf) or None.
     """
-    best = None
-    best_score = -1.0
+    candidates: list[tuple[float, tuple[int, float, float, float, float, float, float, float]]] = []
 
     for box in boxes:
         if box.id is None:
@@ -158,16 +171,91 @@ def pick_ball_box(boxes) -> tuple[int, float, float, float, float, float] | None
         cx = (x1 + x2) / 2
         cy = (y1 + y2) / 2
         area = (x2 - x1) * (y2 - y1)
-        # Prefer high confidence; use area as tie-break for small fast ball
+        score = conf * 1000 + min(area, 5000) * 0.001
+
+        if prediction is not None:
+            dist = math.hypot(cx - prediction[0], cy - prediction[1])
+            if dist <= search_radius:
+                score -= dist * 4.0
+                candidates.append((score, (int(box.id[0]), cx, cy, x1, y1, x2, y2, conf)))
+
+    if candidates:
+        candidates.sort(key=lambda item: item[0], reverse=True)
+        return candidates[0][1]
+
+    # No in-window match: fall back to best confidence (e.g. ball outran prediction).
+    if prediction is not None:
+        return pick_ball_box(boxes, prediction=None, search_radius=search_radius)
+
+    best = None
+    best_score = -1.0
+    for box in boxes:
+        if box.id is None:
+            continue
+        conf = float(box.conf[0])
+        if conf < CONFIDENCE:
+            continue
+        x1, y1, x2, y2 = box.xyxy[0].tolist()
+        cx = (x1 + x2) / 2
+        cy = (y1 + y2) / 2
+        area = (x2 - x1) * (y2 - y1)
         score = conf * 1000 + min(area, 5000) * 0.001
         if score > best_score:
             best_score = score
             best = (int(box.id[0]), cx, cy, x1, y1, x2, y2, conf)
 
-    if best is None:
-        return None
-    tid, cx, cy, x1, y1, x2, y2, _ = best
-    return tid, cx, cy, x1, y1, x2, y2
+    return best
+
+
+def draw_prediction_marker(frame, prediction: tuple[float, float] | None, radius: float) -> None:
+    if prediction is None:
+        return
+    px, py = int(prediction[0]), int(prediction[1])
+    cv2.circle(frame, (px, py), int(radius), (180, 180, 180), 1, cv2.LINE_AA)
+    cv2.drawMarker(
+        frame,
+        (px, py),
+        (180, 180, 180),
+        markerType=cv2.MARKER_CROSS,
+        markerSize=12,
+        thickness=1,
+        line_type=cv2.LINE_AA,
+    )
+
+
+@dataclass
+class KalmanPickState:
+    kalman: BallKalman = field(default_factory=BallKalman)
+    misses: int = 0
+
+    def begin_frame(self) -> tuple[tuple[float, float] | None, float]:
+        if not self.kalman.initialized:
+            return None, KALMAN_SEARCH_RADIUS
+        prediction = self.kalman.predict()
+        radius = self.kalman.search_radius(base_radius=KALMAN_SEARCH_RADIUS)
+        return prediction, radius
+
+    def apply_pick(
+        self,
+        picked: tuple[int, float, float, float, float, float, float, float] | None,
+    ) -> bool:
+        """
+        Update Kalman from a picked box.
+
+        Returns True when the track is considered lost (too many misses → reset).
+        """
+        if picked is None:
+            self.misses += 1
+            if self.misses > KALMAN_MAX_MISSES:
+                self.kalman.reset()
+                self.misses = 0
+                return True
+            return False
+
+        _tid, cx, cy, _x1, _y1, _x2, _y2, _conf = picked
+        self.kalman.update(cx, cy)
+        self.misses = 0
+        return False
 
 
 def draw_track_overlay(
@@ -279,9 +367,10 @@ def run_on_video(
     active_track_id: int | None = None
     frame_idx = 0
     t0 = time.monotonic()
+    kalman_state = KalmanPickState()
 
     print(f"Tracking: {video_path.name} ({width}x{height} @ {fps:.1f} fps)")
-    print(f"Tracker: {TRACKER} | conf>={CONFIDENCE} | imgsz={IMAGE_SIZE}")
+    print(f"Tracker: {TRACKER} | conf>={CONFIDENCE} | imgsz={IMAGE_SIZE} | Kalman search")
 
     if show:
         cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
@@ -301,12 +390,17 @@ def run_on_video(
             verbose=False,
         )
 
+        prediction, search_radius = kalman_state.begin_frame()
         picked = None
         if results and results[0].boxes is not None and len(results[0].boxes):
-            picked = pick_ball_box(results[0].boxes)
+            picked = pick_ball_box(results[0].boxes, prediction, search_radius)
+
+        if kalman_state.apply_pick(picked):
+            active_track_id = None
+        draw_prediction_marker(frame, prediction, search_radius)
 
         if picked is not None:
-            tid, cx, cy, x1, y1, x2, y2 = picked
+            tid, cx, cy, x1, y1, x2, y2, _conf = picked
             active_track_id = tid
             if tid not in tracks:
                 tracks[tid] = BallTrack(track_id=tid)
@@ -360,15 +454,20 @@ def run_on_camera(model: YOLO, camera_index: int) -> int:
     cap = open_camera(camera_index)
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
 
+    auto_exp = SoftwareAutoExposure(cap)
+    auto_exp.settle()
+
     tracks: dict[int, BallTrack] = {}
     active_track_id: int | None = None
     frame_idx = 0
+    kalman_state = KalmanPickState()
 
-    print("Live tracking. Press Q to quit.")
+    print("Live tracking (sky auto-exposure locked). Press Q to quit.")
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    t0 = time.monotonic()
 
     while True:
-        ok, frame = cap.read()
+        ok, frame = read_frame(cap)
         if not ok or frame is None:
             break
 
@@ -381,16 +480,21 @@ def run_on_camera(model: YOLO, camera_index: int) -> int:
             verbose=False,
         )
 
+        prediction, search_radius = kalman_state.begin_frame()
         picked = None
         if results and results[0].boxes is not None and len(results[0].boxes):
-            picked = pick_ball_box(results[0].boxes)
+            picked = pick_ball_box(results[0].boxes, prediction, search_radius)
+
+        if kalman_state.apply_pick(picked):
+            active_track_id = None
+        draw_prediction_marker(frame, prediction, search_radius)
 
         if picked is not None:
-            tid, cx, cy, x1, y1, x2, y2 = picked
+            tid, cx, cy, x1, y1, x2, y2, _conf = picked
             active_track_id = tid
             if tid not in tracks:
                 tracks[tid] = BallTrack(track_id=tid)
-            time_s = frame_idx / fps
+            time_s = time.monotonic() - t0
             tracks[tid].add(frame_idx, time_s, cx, cy)
             cv2.rectangle(
                 frame,
@@ -402,6 +506,16 @@ def run_on_camera(model: YOLO, camera_index: int) -> int:
 
         active = tracks.get(active_track_id) if active_track_id is not None else None
         display = draw_track_overlay(frame, active, active_track_id, frame_idx, fps)
+        cv2.putText(
+            display,
+            auto_exp.status_text(),
+            (10, display.shape[0] - 12),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (200, 200, 200),
+            1,
+            cv2.LINE_AA,
+        )
         cv2.imshow(WINDOW_NAME, display)
 
         if cv2.waitKey(1) & 0xFF in (ord("q"), ord("Q")):
