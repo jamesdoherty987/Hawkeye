@@ -193,20 +193,17 @@ def run_record_loop(cap: cv2.VideoCapture, output_dir: Path, class_name: str) ->
     auto_exp = SoftwareAutoExposure(cap)
     auto_exp.settle()
 
-    ok, first_frame = read_frame(cap, retries=READ_RETRIES)
-    if not ok or first_frame is None:
-        raise RuntimeError(
-            "Couldn't read from camera. Close other apps using it, "
-            "unplug/replug the cable, then try again."
-        )
-
-    frame_height, frame_width = first_frame.shape[:2]
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or FRAME_WIDTH or 1280
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or FRAME_HEIGHT or 720
     writer_fps_placeholder = 30.0
 
     print(f"Saving to: {output_dir}")
     print(f"Resolution: {frame_width}x{frame_height}")
     print(f"Next file: {class_name}_{next_index:06d}.mp4")
-    print("Exposure locked after settle (sky band). Press R to record, Q to quit.")
+    print("Auto-exposure active (sky band). Press R to record, Q to quit.")
+
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
+    cv2.resizeWindow(WINDOW_NAME, 1280, 720)
 
     recording = False
     writer: cv2.VideoWriter | None = None
@@ -250,9 +247,19 @@ def run_record_loop(cap: cv2.VideoCapture, output_dir: Path, class_name: str) ->
         clip_frames = 0
         print(f"Recording -> {current_path.name}")
 
-    frame = first_frame
-
     while True:
+        ok, raw_frame = read_frame(cap, retries=READ_RETRIES)
+        if not ok or raw_frame is None:
+            print(
+                "Lost camera feed. Close other camera apps, unplug/replug, then retry.",
+                file=sys.stderr,
+            )
+            if recording:
+                stop_recording()
+            break
+
+        frame = auto_exp.process(raw_frame)
+
         if recording and writer is not None:
             writer.write(frame)
             clip_frames += 1
@@ -279,17 +286,6 @@ def run_record_loop(cap: cv2.VideoCapture, output_dir: Path, class_name: str) ->
             if recording:
                 stop_recording()
             break
-
-        ok, next_frame = read_frame(cap, retries=READ_RETRIES)
-        if not ok or next_frame is None:
-            print(
-                "Lost camera feed. Close other camera apps, unplug/replug, then retry.",
-                file=sys.stderr,
-            )
-            if recording:
-                stop_recording()
-            break
-        frame = next_frame
 
     if writer is not None:
         writer.release()

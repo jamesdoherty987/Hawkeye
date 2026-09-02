@@ -462,7 +462,7 @@ def run_on_camera(model: YOLO, camera_index: int) -> int:
     frame_idx = 0
     kalman_state = KalmanPickState()
 
-    print("Live tracking (sky auto-exposure locked). Press Q to quit.")
+    print("Live tracking (sky auto-exposure). Press Q to quit.")
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     t0 = time.monotonic()
 
@@ -470,6 +470,8 @@ def run_on_camera(model: YOLO, camera_index: int) -> int:
         ok, frame = read_frame(cap)
         if not ok or frame is None:
             break
+
+        frame = auto_exp.process(frame)
 
         results = model.track(
             frame,

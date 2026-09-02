@@ -178,7 +178,7 @@ def run_detection_loop(cap: cv2.VideoCapture, model: YOLO) -> int:
 
     print(f"Saving detections to: {OUTPUT_DIR}")
     print(f"Starting at: detect_{next_index:06d}.jpg")
-    print("Running custom football model (sky auto-exposure locked). Press Q to quit.")
+    print("Running custom football model (sky auto-exposure). Press Q to quit.")
     cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
     cv2.resizeWindow(WINDOW_NAME, 1280, 720)
 
@@ -187,6 +187,8 @@ def run_detection_loop(cap: cv2.VideoCapture, model: YOLO) -> int:
         if not ok or frame is None:
             print("Couldn't read from camera.", file=sys.stderr)
             break
+
+        frame = auto_exp.process(frame)
 
         results = model.predict(
             source=frame,

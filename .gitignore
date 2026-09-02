@@ -25,7 +25,7 @@ dataset/**/detections/*.jpeg
 dataset/**/detections/*.png
 dataset/**/images/
 dataset/**/labels/
-dataset/**/videos/*.mp4
+#dataset/**/videos/*.mp4
 dataset/**/*.zip
 dataset/**/yolo/train/
 dataset/**/yolo/valid/
