@@ -3,7 +3,9 @@ Play a recorded video at half speed and save frames with SPACE.
 
 Useful when you want to pick only the good ball frames by hand.
 
-SPACE = save current frame → dataset/football/raw/
+SPACE = save current frame (ball) → dataset/football/raw/
+N     = save negative (no ball) → dataset/football/negatives/
+      + yolo/train/images/ + empty yolo/train/labels/*.txt
 A     = jump back 1 seconds
 D     = jump forward 1 seconds
 P     = pause / resume
@@ -27,18 +29,22 @@ import cv2
 CLASS_NAME = "football"
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 OUTPUT_DIR = PROJECT_ROOT / "dataset" / CLASS_NAME / "raw"
+NEGATIVE_DIR = PROJECT_ROOT / "dataset" / CLASS_NAME / "negatives"
+YOLO_TRAIN_IMAGES = PROJECT_ROOT / "dataset" / CLASS_NAME / "yolo" / "train" / "images"
+YOLO_TRAIN_LABELS = PROJECT_ROOT / "dataset" / CLASS_NAME / "yolo" / "train" / "labels"
+NEGATIVE_PREFIX = "negative"
 DEFAULT_SPEED = 0.5
 SEEK_SECONDS = 1.0
 JPEG_QUALITY = 95
-WINDOW_NAME = "Hawkeye Review — SPACE save | A/D seek | P pause | Q quit"
+WINDOW_NAME = "Hawkeye Review — SPACE ball | N negative | A/D seek | Q quit"
 
 
 def ensure_output_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
 
 
-def next_image_index(output_dir: Path, class_name: str) -> int:
-    existing = list(output_dir.glob(f"{class_name}_*.jpg"))
+def next_image_index(output_dir: Path, prefix: str) -> int:
+    existing = list(output_dir.glob(f"{prefix}_*.jpg"))
     if not existing:
         return 1
 
@@ -66,6 +72,7 @@ def draw_overlay(
     frame_index: int,
     total_frames: int,
     saved_count: int,
+    negative_count: int,
     paused: bool,
     speed: float,
 ):
@@ -75,8 +82,9 @@ def draw_overlay(
 
     lines = [
         f"{status}  frame {frame_index}/{total_frames}",
-        f"Saved this session: {saved_count}",
-        "SPACE = save | A/D = +/-1s | P = pause | Q = quit",
+        f"Ball frames saved: {saved_count}",
+        f"Negatives saved: {negative_count}",
+        "SPACE = ball | N = negative | A/D = +/-1s | P = pause | Q = quit",
     ]
 
     y = 30
@@ -96,8 +104,51 @@ def draw_overlay(
     return display
 
 
-def save_frame(frame, output_dir: Path, class_name: str, index: int) -> Path | None:
-    output_path = output_dir / f"{class_name}_{index:06d}.jpg"
+def next_negative_index(*dirs: Path) -> int:
+    """Next index across negatives archive and YOLO train folders."""
+    indices: list[int] = []
+    for output_dir in dirs:
+        for file_path in output_dir.glob(f"{NEGATIVE_PREFIX}_*.jpg"):
+            parts = file_path.stem.rsplit("_", 1)
+            if len(parts) == 2 and parts[1].isdigit():
+                indices.append(int(parts[1]))
+    return (max(indices) + 1) if indices else 1
+
+
+def save_negative_frame(
+    frame,
+    index: int,
+    negative_dir: Path,
+    yolo_images_dir: Path,
+    yolo_labels_dir: Path,
+) -> Path | None:
+    """
+    Save a training negative: image + empty YOLO label file.
+
+    Also keeps a copy in dataset/football/negatives/ for reference.
+    """
+    filename = f"{NEGATIVE_PREFIX}_{index:06d}.jpg"
+    label_name = f"{NEGATIVE_PREFIX}_{index:06d}.txt"
+
+    archive_path = negative_dir / filename
+    yolo_image_path = yolo_images_dir / filename
+    yolo_label_path = yolo_labels_dir / label_name
+
+    encode_params = [int(cv2.IMWRITE_JPEG_QUALITY), JPEG_QUALITY]
+    if not cv2.imwrite(str(archive_path), frame, encode_params):
+        print(f"Failed to save {archive_path}", file=sys.stderr)
+        return None
+    if not cv2.imwrite(str(yolo_image_path), frame, encode_params):
+        print(f"Failed to save {yolo_image_path}", file=sys.stderr)
+        archive_path.unlink(missing_ok=True)
+        return None
+
+    yolo_label_path.write_text("")
+    return archive_path
+
+
+def save_frame(frame, output_dir: Path, prefix: str, index: int) -> Path | None:
+    output_path = output_dir / f"{prefix}_{index:06d}.jpg"
     ok = cv2.imwrite(
         str(output_path),
         frame,
@@ -109,8 +160,17 @@ def save_frame(frame, output_dir: Path, class_name: str, index: int) -> Path | N
     return output_path
 
 
-def review_video(video_path: Path, output_dir: Path, class_name: str, speed: float) -> int:
+def review_video(
+    video_path: Path,
+    output_dir: Path,
+    negative_dir: Path,
+    class_name: str,
+    speed: float,
+) -> tuple[int, int]:
     ensure_output_dir(output_dir)
+    ensure_output_dir(negative_dir)
+    ensure_output_dir(YOLO_TRAIN_IMAGES)
+    ensure_output_dir(YOLO_TRAIN_LABELS)
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
@@ -124,7 +184,9 @@ def review_video(video_path: Path, output_dir: Path, class_name: str, speed: flo
     seek_frames = max(1, int(round(fps * SEEK_SECONDS)))
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
     next_index = next_image_index(output_dir, class_name)
+    next_neg_idx = next_negative_index(negative_dir, YOLO_TRAIN_IMAGES)
     saved_count = 0
+    negative_count = 0
     paused = False
     frame_index = 0
     frame = None
@@ -132,9 +194,13 @@ def review_video(video_path: Path, output_dir: Path, class_name: str, speed: flo
     print(f"Video: {video_path}")
     print(f"Source FPS: {fps:.1f} | playback: {speed}x | frame delay: {delay_ms} ms")
     print(f"Arrow seek: {SEEK_SECONDS:.0f}s ({seek_frames} frames)")
-    print(f"Saving to: {output_dir}")
-    print(f"Starting at: {class_name}_{next_index:06d}.jpg")
-    print("SPACE = save | A/D = +/-1s | P = pause | Q = quit")
+    print(f"Ball frames -> {output_dir}")
+    print(f"Negatives   -> {negative_dir}")
+    print(f"YOLO train  -> {YOLO_TRAIN_IMAGES} (+ empty labels)")
+    print(f"Starting at: {class_name}_{next_index:06d}.jpg / negative_{next_neg_idx:06d}.jpg")
+    print("SPACE = ball | N = negative | A/D = +/-1s | P = pause | Q = quit")
+
+    cv2.namedWindow(WINDOW_NAME, cv2.WINDOW_NORMAL)
 
     def seek(delta_frames: int) -> None:
         nonlocal frame, frame_index
@@ -167,7 +233,13 @@ def review_video(video_path: Path, output_dir: Path, class_name: str, speed: flo
             frame_index += 1
 
         display = draw_overlay(
-            frame, frame_index, total_frames, saved_count, paused, speed
+            frame,
+            frame_index,
+            total_frames,
+            saved_count,
+            negative_count,
+            paused,
+            speed,
         )
         cv2.imshow(WINDOW_NAME, display)
 
@@ -180,9 +252,25 @@ def review_video(video_path: Path, output_dir: Path, class_name: str, speed: flo
         elif key == ord(" "):
             path = save_frame(frame, output_dir, class_name, next_index)
             if path is not None:
-                print(f"Saved {path.name} (video frame {frame_index})")
+                print(f"Saved ball frame {path.name} (video frame {frame_index})")
                 next_index += 1
                 saved_count += 1
+        elif key in (ord("n"), ord("N")):
+            path = save_negative_frame(
+                frame,
+                next_neg_idx,
+                negative_dir,
+                YOLO_TRAIN_IMAGES,
+                YOLO_TRAIN_LABELS,
+            )
+            if path is not None:
+                label_path = YOLO_TRAIN_LABELS / f"{NEGATIVE_PREFIX}_{next_neg_idx:06d}.txt"
+                print(
+                    f"Saved negative {path.name} + YOLO label {label_path.name} "
+                    f"(video frame {frame_index})"
+                )
+                next_neg_idx += 1
+                negative_count += 1
         elif key in (ord("p"), ord("P")):
             paused = not paused
             print("Paused." if paused else "Playing.")
@@ -191,7 +279,7 @@ def review_video(video_path: Path, output_dir: Path, class_name: str, speed: flo
 
     cap.release()
     cv2.destroyAllWindows()
-    return saved_count
+    return saved_count, negative_count
 
 
 def parse_args() -> argparse.Namespace:
@@ -220,8 +308,10 @@ def main() -> int:
 
     try:
         video_path = resolve_video_path(args.video)
-        saved = review_video(video_path, OUTPUT_DIR, CLASS_NAME, args.speed)
-        print(f"Done. Saved {saved} frame(s).")
+        saved, negatives = review_video(
+            video_path, OUTPUT_DIR, NEGATIVE_DIR, CLASS_NAME, args.speed
+        )
+        print(f"Done. Saved {saved} ball frame(s) and {negatives} negative(s).")
         return 0
     except (FileNotFoundError, RuntimeError) as exc:
         print(str(exc), file=sys.stderr)

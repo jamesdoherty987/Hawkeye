@@ -54,6 +54,9 @@ class BallKalman:
         if not self.initialized:
             return None
         state = self._kf.predict()
+        # Advance internal state so predictions keep moving on missed frames.
+        # OpenCV only updates statePost in correct(), not predict().
+        self._kf.statePost = state
         vx = float(state[2])
         vy = float(state[3])
         self._speed_px = math.hypot(vx, vy)

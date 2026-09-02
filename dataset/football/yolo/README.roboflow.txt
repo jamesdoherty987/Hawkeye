@@ -2,7 +2,7 @@
 Football Spotter - vdataset football-spotter
 ==============================
 
-This dataset was exported via roboflow.com on August 5, 2026 at 3:56 PM GMT
+This dataset was exported via roboflow.com on September 2, 2026 at 10:49 AM GMT
 
 Roboflow is an end-to-end computer vision platform that helps you
 * collaborate with your team on computer vision projects
@@ -17,7 +17,7 @@ visit https://github.com/roboflow/notebooks
 
 To find over 100k other datasets and pre-trained models, visit https://universe.roboflow.com
 
-The dataset includes 120 images.
+The dataset includes 287 images.
 Football-Spotter are annotated in YOLOv8 format.
 
 No pre-processing or augmentation was applied.
