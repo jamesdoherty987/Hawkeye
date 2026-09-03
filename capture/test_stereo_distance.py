@@ -6,6 +6,9 @@ Assumes:
   - Roughly parallel, both looking at the ball
   - Left camera = --left, right camera = --right
 
+Uses the same capture settings as record_video.py:
+  1280x720, sky-band SoftwareAutoExposure (brightness / exposure / gain).
+
 Depth (metres) from parallel stereo:
   Z = (focal_px * baseline_m) / disparity_px
 
@@ -20,6 +23,12 @@ Example:
   python capture/test_stereo_distance.py --left 0 --right 1 --focal 900
 
 Keys: C = calibrate at --known-distance | Q = quit
+
+Indoor / new environment (ball not detected):
+  - Lower confidence: --conf 0.25 (model was trained outdoors on sky)
+  - Fix sideways sensor: --rotate 90 or --rotate -90 (try both)
+  - Verify one camera first: python capture/test_detect.py
+  - Brighter ball, plain background, move ball to centre of frame
 """
 
 from __future__ import annotations
@@ -36,7 +45,7 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
-from auto_exposure import read_frame, try_set
+from auto_exposure import SoftwareAutoExposure, read_frame, try_set
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -50,7 +59,10 @@ FRAME_HEIGHT = 720
 BASELINE_M = 1.0
 KNOWN_DISTANCE_M = 5.0
 SMOOTH_N = 8
-WINDOW = "Hawkeye Stereo Distance — C calibrate | Q quit"
+WARMUP_FRAMES = 10
+READ_RETRIES = 30
+WINDOW_STEREO = "Hawkeye Stereo — C calibrate | Q quit"
+DISPLAY_SCALE = 0.5  # each cam scaled before side-by-side panel
 
 
 def default_focal_px(image_width: int) -> float:
@@ -65,6 +77,7 @@ def camera_backends() -> list[tuple[str, int]]:
         return [("AVFoundation", cv2.CAP_AVFOUNDATION), ("default", cv2.CAP_ANY)]
     if system == "Linux":
         return [("V4L2", cv2.CAP_V4L2), ("default", cv2.CAP_ANY)]
+    # Windows — MSMF is better for Arducam exposure controls; DSHOW as fallback.
     return [
         ("MSMF", cv2.CAP_MSMF),
         ("DirectShow", cv2.CAP_DSHOW),
@@ -72,26 +85,60 @@ def camera_backends() -> list[tuple[str, int]]:
     ]
 
 
-def open_camera(index: int) -> cv2.VideoCapture:
+def rotate_frame(frame, degrees: int):
+    """Rotate captured frame so the wide FOV is horizontal (cam mounted sideways)."""
+    if degrees == 0:
+        return frame
+    if degrees == 90:
+        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    if degrees in (-90, 270):
+        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    if degrees == 180:
+        return cv2.rotate(frame, cv2.ROTATE_180)
+    raise ValueError(f"Unsupported --rotate {degrees}; use 0, 90, -90, or 180")
+
+
+def capture_resolution(swap_res: bool) -> tuple[int, int]:
+    """Request WxH from the driver; --swap-res asks for portrait before rotating."""
+    width, height = FRAME_WIDTH, FRAME_HEIGHT
+    if swap_res:
+        width, height = height, width
+    return width, height
+
+
+def open_camera(index: int, swap_res: bool = False) -> cv2.VideoCapture:
+    """Open USB camera with the same backends / resolution as record_video.py."""
+    last_error = f"Couldn't open camera {index}."
+    req_w, req_h = capture_resolution(swap_res)
+
     for name, backend in camera_backends():
+        print(f"Trying camera {index} via {name}...")
         cap = cv2.VideoCapture(index, backend)
         if not cap.isOpened():
             cap.release()
             continue
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_WIDTH)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_HEIGHT)
+
+        if req_w is not None:
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, req_w)
+        if req_h is not None:
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, req_h)
         try_set(cap, cv2.CAP_PROP_BUFFERSIZE, 1)
-        ok, frame = read_frame(cap, retries=15)
+
+        ok, frame = read_frame(cap, retries=max(WARMUP_FRAMES, 1))
         if ok and frame is not None:
             print(
                 f"Camera {index} opened via {name} "
                 f"({frame.shape[1]}x{frame.shape[0]})"
             )
             return cap
+
         cap.release()
-    raise RuntimeError(
-        f"Couldn't open camera {index}. Try other --left / --right indices."
-    )
+        last_error = (
+            f"Camera {index} opened via {name} but no frames came through. "
+            "Close other camera apps, unplug/replug, then try again."
+        )
+
+    raise RuntimeError(last_error)
 
 
 def load_model() -> YOLO:
@@ -210,11 +257,12 @@ def resolve_focal(
 def detect_ball(
     model: YOLO,
     frame,
+    confidence: float = CONFIDENCE,
 ) -> tuple[float, float, float, float, float, float, float] | None:
     """(cx, cy, x1, y1, x2, y2, conf) or None."""
     results = model.predict(
         frame,
-        conf=CONFIDENCE,
+        conf=min(confidence, 0.15),
         imgsz=IMAGE_SIZE,
         verbose=False,
     )
@@ -229,6 +277,8 @@ def detect_ball(
         x1, y1, x2, y2 = box.xyxy[0].tolist()
         best_conf = conf
         best = ((x1 + x2) / 2.0, (y1 + y2) / 2.0, x1, y1, x2, y2, conf)
+    if best is None or best_conf < confidence:
+        return None
     return best
 
 
@@ -236,6 +286,8 @@ def paint(
     frame,
     title: str,
     det: tuple[float, float, float, float, float, float, float] | None,
+    status: str = "",
+    exposure_text: str = "",
 ) -> None:
     cv2.putText(
         frame,
@@ -258,20 +310,92 @@ def paint(
             2,
             cv2.LINE_AA,
         )
-        return
-    cx, cy, x1, y1, x2, y2, conf = det
-    cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 165, 255), 2)
-    cv2.circle(frame, (int(cx), int(cy)), 6, (0, 255, 255), -1)
-    cv2.putText(
-        frame,
-        f"ball {conf:.2f}  cx={cx:.0f}",
-        (12, 58),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.65,
-        (0, 255, 0),
-        2,
-        cv2.LINE_AA,
-    )
+    else:
+        cx, cy, x1, y1, x2, y2, conf = det
+        cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 165, 255), 2)
+        cv2.circle(frame, (int(cx), int(cy)), 6, (0, 255, 255), -1)
+        cv2.putText(
+            frame,
+            f"ball {conf:.2f}  cx={cx:.0f}",
+            (12, 58),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (0, 255, 0),
+            2,
+            cv2.LINE_AA,
+        )
+
+    if exposure_text:
+        cv2.putText(
+            frame,
+            exposure_text,
+            (12, 88),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.5,
+            (200, 200, 200),
+            1,
+            cv2.LINE_AA,
+        )
+
+    if status:
+        h = frame.shape[0]
+        cv2.rectangle(frame, (0, h - 40), (frame.shape[1], h), (0, 0, 0), -1)
+        cv2.putText(
+            frame,
+            status,
+            (12, h - 14),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.65,
+            (0, 255, 255),
+            2,
+            cv2.LINE_AA,
+        )
+
+
+def create_resizable_window(name: str, width: int, height: int) -> None:
+    """OpenCV window the user can freely resize; feed scales to match."""
+    cv2.namedWindow(name, cv2.WINDOW_NORMAL)
+    try:
+        cv2.setWindowProperty(name, cv2.WND_PROP_ASPECT_RATIO, cv2.WINDOW_FREERATIO)
+    except cv2.error:
+        pass
+    cv2.resizeWindow(name, width, height)
+
+
+def imshow_fitted(window_name: str, frame) -> None:
+    """Show frame stretched to the current window size so resizing works."""
+    try:
+        _x, _y, win_w, win_h = cv2.getWindowImageRect(window_name)
+    except cv2.error:
+        win_w, win_h = 0, 0
+
+    if win_w > 1 and win_h > 1 and (win_w != frame.shape[1] or win_h != frame.shape[0]):
+        display = cv2.resize(frame, (win_w, win_h), interpolation=cv2.INTER_AREA)
+    else:
+        display = frame
+    cv2.imshow(window_name, display)
+
+
+def build_stereo_panel(frame_l, frame_r, scale: float):
+    """Scale each feed and stack left | right in one image."""
+    if scale <= 0 or scale > 1.0:
+        raise ValueError("--display-scale must be in (0, 1]")
+    if scale != 1.0:
+        frame_l = cv2.resize(
+            frame_l,
+            None,
+            fx=scale,
+            fy=scale,
+            interpolation=cv2.INTER_AREA,
+        )
+        frame_r = cv2.resize(
+            frame_r,
+            None,
+            fx=scale,
+            fy=scale,
+            interpolation=cv2.INTER_AREA,
+        )
+    return np.hstack([frame_l, frame_r])
 
 
 def main() -> int:
@@ -297,12 +421,36 @@ def main() -> int:
         help="Focal length in pixels (skips saved calib / default)",
     )
     parser.add_argument("--list", action="store_true", help="Probe camera indices 0–4 and exit")
+    parser.add_argument(
+        "--conf",
+        type=float,
+        default=CONFIDENCE,
+        help=f"Detection confidence threshold (default {CONFIDENCE}; try 0.25 indoors)",
+    )
+    parser.add_argument(
+        "--rotate",
+        type=int,
+        default=90,
+        choices=[0, 90, -90, 180],
+        help="Rotate frames so wide FOV is horizontal (default 90; use -90 if upside-down)",
+    )
+    parser.add_argument(
+        "--swap-res",
+        action="store_true",
+        help="Request portrait resolution from camera before --rotate (try if still sideways)",
+    )
+    parser.add_argument(
+        "--display-scale",
+        type=float,
+        default=DISPLAY_SCALE,
+        help=f"Scale each camera before side-by-side panel (default {DISPLAY_SCALE})",
+    )
     args = parser.parse_args()
 
     if args.list:
         for i in range(5):
             try:
-                cap = open_camera(i)
+                cap = open_camera(i, swap_res=False)
                 print(f"  OK index {i}")
                 cap.release()
             except RuntimeError as exc:
@@ -318,11 +466,18 @@ def main() -> int:
     if args.known_distance <= 0:
         print("ERROR: --known-distance must be > 0", file=sys.stderr)
         return 1
+    if not 0.0 < args.conf <= 1.0:
+        print("ERROR: --conf must be in (0, 1]", file=sys.stderr)
+        return 1
+    if args.display_scale <= 0 or args.display_scale > 1.0:
+        print("ERROR: --display-scale must be in (0, 1]", file=sys.stderr)
+        return 1
 
     print(
         f"Baseline={args.baseline:.3f} m | left={args.left} right={args.right}\n"
         f"Mount: LEFT=--left, RIGHT=--right, ~parallel, {args.baseline:.2f} m apart.\n"
         f"Calibrate: put ball at {args.known_distance:.2f} m, both must see it, press C.\n"
+        f"Rotate={args.rotate}° | conf={args.conf:.2f} | display-scale={args.display_scale:.2f}\n"
         "Q quit."
     )
 
@@ -330,9 +485,9 @@ def main() -> int:
     cap_l = None
     cap_r = None
     try:
-        cap_l = open_camera(args.left)
+        cap_l = open_camera(args.left, swap_res=args.swap_res)
         try:
-            cap_r = open_camera(args.right)
+            cap_r = open_camera(args.right, swap_res=args.swap_res)
         except RuntimeError:
             cap_l.release()
             raise
@@ -342,6 +497,9 @@ def main() -> int:
         if not ok_l or probe_l is None or not ok_r or probe_r is None:
             print("ERROR: couldn't read initial frames from both cameras.", file=sys.stderr)
             return 1
+
+        probe_l = rotate_frame(probe_l, args.rotate)
+        probe_r = rotate_frame(probe_r, args.rotate)
 
         if probe_l.shape[1] != probe_r.shape[1] or probe_l.shape[0] != probe_r.shape[0]:
             print(
@@ -357,21 +515,32 @@ def main() -> int:
             print(f"ERROR: {exc}", file=sys.stderr)
             return 1
 
+        print("Setting up sky auto-exposure on both cameras (same as record_video)...")
+        auto_l = SoftwareAutoExposure(cap_l)
+        auto_r = SoftwareAutoExposure(cap_r)
+        auto_l.settle()
+        auto_r.settle()
+
         depths: list[float] = []
-        cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
+        panel_w = max(1, int(probe_l.shape[1] * args.display_scale * 2))
+        panel_h = max(1, int(probe_l.shape[0] * args.display_scale))
+        create_resizable_window(WINDOW_STEREO, panel_w, panel_h)
 
         while True:
-            ok_l, frame_l = read_frame(cap_l)
-            ok_r, frame_r = read_frame(cap_r)
-            if not ok_l or frame_l is None or not ok_r or frame_r is None:
+            ok_l, raw_l = read_frame(cap_l, retries=READ_RETRIES)
+            ok_r, raw_r = read_frame(cap_r, retries=READ_RETRIES)
+            if not ok_l or raw_l is None or not ok_r or raw_r is None:
                 print("Frame grab failed; check USB / indices.")
                 time.sleep(0.05)
                 continue
 
-            det_l = detect_ball(model, frame_l)
-            det_r = detect_ball(model, frame_r)
-            paint(frame_l, f"LEFT (cam {args.left})", det_l)
-            paint(frame_r, f"RIGHT (cam {args.right})", det_r)
+            raw_l = rotate_frame(raw_l, args.rotate)
+            raw_r = rotate_frame(raw_r, args.rotate)
+            frame_l = auto_l.process(raw_l)
+            frame_r = auto_r.process(raw_r)
+
+            det_l = detect_ball(model, frame_l, confidence=args.conf)
+            det_r = detect_ball(model, frame_r, confidence=args.conf)
 
             status = "need ball in BOTH views"
             z_m: float | None = None
@@ -403,23 +572,22 @@ def main() -> int:
             else:
                 depths.clear()
 
-            h = min(frame_l.shape[0], frame_r.shape[0])
-            w = min(frame_l.shape[1], frame_r.shape[1])
-            left = cv2.resize(frame_l, (w, h))
-            right = cv2.resize(frame_r, (w, h))
-            combo = np.hstack([left, right])
-            cv2.rectangle(combo, (0, h - 40), (combo.shape[1], h), (0, 0, 0), -1)
-            cv2.putText(
-                combo,
-                status,
-                (12, h - 14),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 255, 255),
-                2,
-                cv2.LINE_AA,
+            paint(
+                frame_l,
+                f"LEFT (cam {args.left}) {frame_l.shape[1]}x{frame_l.shape[0]}",
+                det_l,
+                status=status,
+                exposure_text=auto_l.status_text(),
             )
-            cv2.imshow(WINDOW, combo)
+            paint(
+                frame_r,
+                f"RIGHT (cam {args.right}) {frame_r.shape[1]}x{frame_r.shape[0]}",
+                det_r,
+                status=status,
+                exposure_text=auto_r.status_text(),
+            )
+            panel = build_stereo_panel(frame_l, frame_r, args.display_scale)
+            imshow_fitted(WINDOW_STEREO, panel)
 
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), ord("Q")):
