@@ -37,12 +37,28 @@ from auto_exposure import try_set
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 CALIB_PATH = PROJECT_ROOT / "exports" / "stereo" / "simple_focal.json"
 
-# COCO pretrained — class 32 is "sports ball" (football, rugby ball, etc.)
-COCO_MODEL = "yolov8n.pt"
+# COCO pretrained — class 32 = sports ball, class 0 = person
+# yolov8m (medium) is noticeably better than small at finding balls at a distance.
+COCO_MODEL = "yolov8m.pt"
 SPORTS_BALL_CLASS = 32
+PERSON_CLASS = 0
 
 IMAGE_SIZE = 640
-CONFIDENCE = 0.30          # COCO sports ball; lower is more sensitive
+CONFIDENCE = 0.15          # low — restricted to sports-ball class so false positives are rare
+
+# Hardcoded focal length for this specific camera+lens+resolution combination.
+# Measured by calibration: Arducam UC-844, native 640×480, rotated -90° → 480×640.
+# Physical equivalent: ~2.5 mm focal length on a 1/4" sensor.
+# If you change cameras, resolution, or lenses, press C at a known distance to recalibrate.
+HARDCODED_FOCAL_PX = 438.4   # px  (baseline 1.0 m, calibrated at 5.0 m, disparity 87.7 px)
+
+# SimpleBlobDetector fallback — finds compact, round, convex blobs only.
+# Windows / furniture / heads fail the circularity + convexity + inertia tests.
+BLOB_MIN_AREA = 300        # px² — ignore tiny specks
+BLOB_MAX_AREA = 120_000    # px² — ignore huge blobs
+BLOB_MIN_CIRCULARITY = 0.55  # 0–1; circle=1, square≈0.78, window frame≈0.1
+BLOB_MIN_CONVEXITY = 0.80
+BLOB_MIN_INERTIA = 0.40    # 0=line, 1=circle; elongated shapes (windows) fail this
 BASELINE_M = 1.0
 KNOWN_DISTANCE_M = 5.0
 SMOOTH_N = 8
@@ -119,32 +135,39 @@ def read_frame(cap: cv2.VideoCapture, retries: int = 5):
 # ---------------------------------------------------------------------------
 
 def load_coco_model() -> YOLO:
-    """Load standard COCO YOLOv8n. Downloads ~6 MB on first run."""
+    """Load COCO YOLOv8s. Downloads ~22 MB on first run."""
     print(f"Loading COCO model ({COCO_MODEL}) — downloads automatically if not cached...")
     model = YOLO(COCO_MODEL)
     print("Model ready.")
     return model
 
 
-def detect_ball(
-    model: YOLO,
-    frame,
-    conf: float,
-) -> tuple[float, float, float, float, float, float, float] | None:
-    """Return (cx, cy, x1, y1, x2, y2, conf) for the best sports-ball box, or None."""
+def _yolo_predict(model: YOLO, frame, conf: float, classes: list[int]):
+    """Run YOLO and return the raw boxes result (or None)."""
     results = model.predict(
         frame,
         conf=conf,
-        classes=[SPORTS_BALL_CLASS],
+        classes=classes,
         imgsz=IMAGE_SIZE,
         verbose=False,
     )
     if not results or results[0].boxes is None or len(results[0].boxes) == 0:
         return None
+    return results[0].boxes
 
+
+def _detect_yolo_ball(
+    model: YOLO,
+    frame,
+    conf: float,
+) -> tuple[float, float, float, float, float, float, float] | None:
+    """YOLO sports-ball detection only. Returns (cx,cy,x1,y1,x2,y2,conf) or None."""
+    boxes = _yolo_predict(model, frame, conf, [SPORTS_BALL_CLASS])
+    if boxes is None:
+        return None
     best = None
     best_conf = -1.0
-    for box in results[0].boxes:
+    for box in boxes:
         c = float(box.conf[0])
         if c <= best_conf:
             continue
@@ -152,6 +175,105 @@ def detect_ball(
         best_conf = c
         best = ((x1 + x2) / 2.0, (y1 + y2) / 2.0, x1, y1, x2, y2, c)
     return best
+
+
+def _make_blob_detector() -> cv2.SimpleBlobDetector:
+    """
+    Build a SimpleBlobDetector tuned for a round ball.
+
+    A ball scores high on circularity (~0.85+), convexity (~0.9+) and inertia
+    (~0.7+).  Windows, door frames, heads, and light fittings all fail at
+    least one of these tests.
+    """
+    p = cv2.SimpleBlobDetector_Params()
+    p.filterByArea = True
+    p.minArea = BLOB_MIN_AREA
+    p.maxArea = BLOB_MAX_AREA
+    p.filterByCircularity = True
+    p.minCircularity = BLOB_MIN_CIRCULARITY
+    p.filterByConvexity = True
+    p.minConvexity = BLOB_MIN_CONVEXITY
+    p.filterByInertia = True
+    p.minInertiaRatio = BLOB_MIN_INERTIA
+    p.filterByColor = False
+    p.minDistBetweenBlobs = 20
+    return cv2.SimpleBlobDetector_create(p)
+
+
+# Create once at module level so it isn't rebuilt every frame
+_BLOB_DETECTOR = _make_blob_detector()
+
+
+def _person_boxes(model: YOLO, frame) -> list[tuple[int, int, int, int]]:
+    """Return (x1,y1,x2,y2) for every person YOLO finds."""
+    boxes = _yolo_predict(model, frame, conf=0.35, classes=[PERSON_CLASS])
+    if boxes is None:
+        return []
+    return [tuple(int(v) for v in box.xyxy[0].tolist()) for box in boxes]
+
+
+def _detect_blob(
+    frame,
+    person_boxes: list[tuple[int, int, int, int]],
+) -> tuple[float, float, float, float, float, float, float] | None:
+    """
+    SimpleBlobDetector fallback.
+
+    Steps:
+      1. Convert to grayscale and blur lightly.
+      2. Mask out every person bounding box so body parts can't fire.
+      3. Run the detector — it only returns compact, round, convex blobs.
+      4. Return the largest surviving blob (most likely the ball).
+    """
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+
+    # Mask person regions before detection
+    mask = np.ones(gray.shape, dtype=np.uint8) * 255
+    for (px1, py1, px2, py2) in person_boxes:
+        pad = 15
+        y1c = max(0, py1 - pad)
+        y2c = min(gray.shape[0], py2 + pad)
+        x1c = max(0, px1 - pad)
+        x2c = min(gray.shape[1], px2 + pad)
+        mask[y1c:y2c, x1c:x2c] = 0
+
+    # Blob detector finds dark blobs by default; try both polarities
+    masked = cv2.bitwise_and(gray, mask)
+    blurred = cv2.GaussianBlur(masked, (7, 7), 0)
+
+    keypoints = _BLOB_DETECTOR.detect(blurred)
+
+    # Also try inverted (light ball on dark background)
+    inv = cv2.bitwise_not(blurred)
+    keypoints_inv = _BLOB_DETECTOR.detect(inv)
+
+    # Merge and pick the largest
+    all_kp = list(keypoints) + list(keypoints_inv)
+    if not all_kp:
+        return None
+
+    best_kp = max(all_kp, key=lambda kp: kp.size)
+    cx, cy = best_kp.pt
+    r = best_kp.size / 2.0
+    x1, y1, x2, y2 = cx - r, cy - r, cx + r, cy + r
+    return (cx, cy, x1, y1, x2, y2, 0.50)
+
+
+def detect_ball(
+    model: YOLO,
+    frame,
+    conf: float,
+) -> tuple[float, float, float, float, float, float, float] | None:
+    """
+    1. Try YOLO sports-ball (class 32, low confidence).
+    2. If nothing found, detect persons to build an exclusion mask.
+    3. Run SimpleBlobDetector on the masked frame — only compact round blobs pass.
+    """
+    det = _detect_yolo_ball(model, frame, conf)
+    if det is not None:
+        return det
+    persons = _person_boxes(model, frame)
+    return _detect_blob(frame, persons)
 
 
 # ---------------------------------------------------------------------------
@@ -233,11 +355,23 @@ def resolve_focal(cli_focal: float | None, baseline_m: float, image_width: int) 
         print(f"Using saved focal_px={focal:.1f}")
         return focal
 
-    focal = default_focal_px(image_width)
-    print(
-        f"No saved calib — using rough default focal_px={focal:.1f}.\n"
-        f"Put ball at {KNOWN_DISTANCE_M:.1f} m (or --known-distance) and press C."
-    )
+    # Fall back to the hardcoded value from our own calibration run.
+    # This is correct for Arducam UC-844 at 640×480 rotated -90° (→ 480×640).
+    # Scale it if the actual image width differs from the calibration width.
+    CALIB_WIDTH = 480  # width used when HARDCODED_FOCAL_PX was measured
+    focal = HARDCODED_FOCAL_PX
+    if image_width != CALIB_WIDTH and CALIB_WIDTH > 0:
+        focal = focal * image_width / CALIB_WIDTH
+        print(
+            f"Using hardcoded focal_px={HARDCODED_FOCAL_PX:.1f} scaled "
+            f"for width {CALIB_WIDTH}→{image_width} → focal_px={focal:.1f}"
+        )
+    else:
+        print(
+            f"Using hardcoded focal_px={focal:.1f} "
+            "(Arducam UC-844, 480px wide after -90° rotation). "
+            "Press C at a known distance to recalibrate if needed."
+        )
     return focal
 
 
@@ -247,15 +381,20 @@ def resolve_focal(cli_focal: float | None, baseline_m: float, image_width: int) 
 
 def paint(frame, title: str,
           det: tuple[float, float, float, float, float, float, float] | None) -> None:
-    h, w = frame.shape[:2]
     cv2.putText(frame, title, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 255), 2, cv2.LINE_AA)
     if det is None:
         cv2.putText(frame, "no ball", (12, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 0, 255), 2, cv2.LINE_AA)
         return
     cx, cy, x1, y1, x2, y2, conf = det
-    cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), (0, 165, 255), 2)
+    # Hough detections have conf==0.50 exactly; YOLO detections vary
+    method = "hough" if conf == 0.50 else "yolo"
+    colour = (255, 160, 0) if method == "hough" else (0, 165, 255)
+    cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), colour, 2)
     cv2.circle(frame, (int(cx), int(cy)), 6, (0, 255, 255), -1)
-    cv2.putText(frame, f"ball {conf:.2f}", (12, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2, cv2.LINE_AA)
+    cv2.putText(
+        frame, f"ball [{method}] {conf:.2f}", (12, 58),
+        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 0), 2, cv2.LINE_AA,
+    )
 
 
 def add_status_bar(combo, status: str) -> None:
@@ -268,8 +407,25 @@ def add_status_bar(combo, status: str) -> None:
 # Main
 # ---------------------------------------------------------------------------
 
+def rotate_frame(frame, degrees: int):
+    """Rotate frame so the wide sensor axis is horizontal (cam mounted sideways)."""
+    if degrees == 0:
+        return frame
+    if degrees == 90:
+        return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+    if degrees in (-90, 270):
+        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    if degrees == 180:
+        return cv2.rotate(frame, cv2.ROTATE_180)
+    raise ValueError(f"Unsupported rotation {degrees}; use 0, 90, -90, or 180")
+
+
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Dual-camera football distance test")
+    parser = argparse.ArgumentParser(
+        description="Dual-camera football distance test",
+        # Allow --rotate=-90 with equals sign (argparse treats bare '-90' as a flag)
+        fromfile_prefix_chars="@",
+    )
     parser.add_argument("--left",  type=int, default=0, help="Left camera index (default 0)")
     parser.add_argument("--right", type=int, default=1, help="Right camera index (default 1)")
     parser.add_argument("--baseline", type=float, default=BASELINE_M,
@@ -282,7 +438,30 @@ def main() -> int:
                         help=f"Detection confidence (default {CONFIDENCE})")
     parser.add_argument("--list", action="store_true",
                         help="Probe camera indices 0–5 and exit")
-    args = parser.parse_args()
+    parser.add_argument(
+        "--rotate", type=int, default=-90,
+        help=(
+            "Rotate each frame so the wide FOV axis is horizontal. "
+            "Default 90 (clockwise). Use --rotate=-90 for counter-clockwise, "
+            "--rotate=0 if already landscape, --rotate=180 to flip."
+        ),
+    )
+    # Parse with a small trick so '-90' is not mistaken for a flag:
+    # users must write --rotate=-90 (with '=').  We also handle the bare
+    # negative case gracefully by pre-processing sys.argv.
+    raw_args = sys.argv[1:]
+    fixed_args = []
+    i = 0
+    while i < len(raw_args):
+        arg = raw_args[i]
+        # Turn '--rotate -90' (two tokens) into '--rotate=-90' (one token)
+        if arg == "--rotate" and i + 1 < len(raw_args) and raw_args[i + 1].lstrip("-").isdigit():
+            fixed_args.append(f"--rotate={raw_args[i + 1]}")
+            i += 2
+        else:
+            fixed_args.append(arg)
+            i += 1
+    args = parser.parse_args(fixed_args)
 
     if args.list:
         print("Probing cameras 0–5:")
@@ -308,10 +487,14 @@ def main() -> int:
     if not 0.0 < args.conf <= 1.0:
         print("ERROR: --conf must be in (0, 1]", file=sys.stderr)
         return 1
+    if args.rotate not in (0, 90, -90, 180, 270):
+        print("ERROR: --rotate must be 0, 90, -90, or 180", file=sys.stderr)
+        return 1
 
     print(
         f"\nBaseline={args.baseline:.3f} m | left cam={args.left} | right cam={args.right}\n"
         f"Known-distance for C key = {args.known_distance:.2f} m | conf={args.conf:.2f}\n"
+        f"Rotation = {args.rotate}°  (use --rotate=0 if already landscape)\n"
         "Q = quit\n"
     )
 
@@ -342,10 +525,12 @@ def main() -> int:
             print("ERROR: right camera gave no frames.", file=sys.stderr)
             return 1
 
+        probe_l = rotate_frame(probe_l, args.rotate)
+        probe_r = rotate_frame(probe_r, args.rotate)
         w_l, h_l = probe_l.shape[1], probe_l.shape[0]
         w_r, h_r = probe_r.shape[1], probe_r.shape[0]
-        print(f"Left  actual resolution: {w_l}x{h_l}")
-        print(f"Right actual resolution: {w_r}x{h_r}")
+        print(f"Left  resolution after rotation: {w_l}x{h_l}")
+        print(f"Right resolution after rotation: {w_r}x{h_r}")
         if w_l != w_r or h_l != h_r:
             print("WARNING: resolutions differ — using centre-relative disparity (still valid).")
 
@@ -368,6 +553,9 @@ def main() -> int:
                 print("Frame grab failed — check USB connections.")
                 time.sleep(0.05)
                 continue
+
+            frame_l = rotate_frame(frame_l, args.rotate)
+            frame_r = rotate_frame(frame_r, args.rotate)
 
             det_l = detect_ball(model, frame_l, args.conf)
             det_r = detect_ball(model, frame_r, args.conf)

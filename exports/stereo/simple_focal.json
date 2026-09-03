@@ -1,0 +1,8 @@
+{
+  "focal_px": 438.4187316894531,
+  "baseline_m": 1.0,
+  "calibrated_at_m": 5.0,
+  "disparity_px": 87.68374633789062,
+  "image_width": 480,
+  "note": "Redo C if cameras move, resolution changes, or baseline changes"
+}
