@@ -43,18 +43,19 @@ import numpy as np
 from ultralytics import YOLO
 
 from auto_exposure import try_set
+import stereo_config as cfg
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
-CALIB_PATH = PROJECT_ROOT / "exports" / "stereo" / "simple_focal.json"
+
+# NOTE: test_stereo_distance.py assumes PARALLEL (forward-facing) cameras.
+# For the real converging rig (25° inward, 25° upward) use stereo_calibrate.py.
 
 COCO_MODEL = "yolov8n.pt"
 SPORTS_BALL_CLASS = 32        # only used with the COCO model
 
 IMAGE_SIZE = 640              # keep at 640 — ball is ~2-3 px at 20 m, too small at 320
 CONFIDENCE = 0.30
-BASELINE_M = 1.0
-KNOWN_DISTANCE_M = 5.0
 SMOOTH_N = 8
 WINDOW = "Hawkeye Stereo — C calibrate | Q quit"
 
@@ -180,8 +181,9 @@ def _parse_best(result) -> tuple[float, float, float, float, float, float, float
 # ---------------------------------------------------------------------------
 
 def default_focal_px(image_width: int) -> float:
-    """Rough guess assuming ~70° HFOV. Press C at a known distance to calibrate."""
-    return (max(image_width, 1) / 2.0) / math.tan(math.radians(70.0 / 2.0))
+    """Spec-based: 70° HFOV (B0332 + LN013). Press C at a known distance to refine."""
+    f, _ = cfg.get_focal_px(image_width)
+    return f
 
 
 def horizontal_disparity(cx_l: float, w_l: int, cx_r: float, w_r: int) -> float:
@@ -238,34 +240,8 @@ def between_posts_verdict(
 
 
 # ---------------------------------------------------------------------------
-# Calibration persistence
+# Calibration persistence — delegates to stereo_config
 # ---------------------------------------------------------------------------
-
-def load_saved_calib() -> dict | None:
-    if not CALIB_PATH.exists():
-        return None
-    try:
-        data = json.loads(CALIB_PATH.read_text())
-        if float(data["focal_px"]) <= 0:
-            return None
-        return data
-    except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
-        return None
-
-
-def save_calib(focal_px: float, baseline_m: float, known_z_m: float,
-               disparity_px: float, image_width: int) -> None:
-    CALIB_PATH.parent.mkdir(parents=True, exist_ok=True)
-    CALIB_PATH.write_text(json.dumps({
-        "focal_px": focal_px,
-        "baseline_m": baseline_m,
-        "calibrated_at_m": known_z_m,
-        "disparity_px": disparity_px,
-        "image_width": image_width,
-        "note": "Redo C if cameras move, resolution changes, or baseline changes",
-    }, indent=2))
-    print(f"Saved focal_px={focal_px:.1f} → {CALIB_PATH}")
-
 
 def resolve_focal(cli_focal: float | None, baseline_m: float, image_width: int) -> float:
     if cli_focal is not None:
@@ -274,28 +250,35 @@ def resolve_focal(cli_focal: float | None, baseline_m: float, image_width: int) 
         print(f"Using CLI focal_px={cli_focal:.1f}")
         return cli_focal
 
-    saved = load_saved_calib()
-    if saved is not None:
-        focal = float(saved["focal_px"])
-        saved_w = int(saved.get("image_width") or image_width)
-        if saved_w > 0 and saved_w != image_width:
-            focal *= image_width / saved_w
-            print(f"Scaled saved focal for resolution change → focal_px={focal:.1f}")
-        saved_b = float(saved.get("baseline_m") or baseline_m)
-        if abs(saved_b - baseline_m) > 0.01:
-            print(
-                f"WARNING: saved calib used baseline {saved_b:.3f} m, "
-                f"now running {baseline_m:.3f} m — press C to recalibrate."
-            )
-        print(f"Using saved focal_px={focal:.1f}")
-        return focal
-
-    focal = default_focal_px(image_width)
-    print(
-        f"No saved calib — using rough default focal_px={focal:.1f}.\n"
-        f"Put ball at {KNOWN_DISTANCE_M:.1f} m (or --known-distance) and press C."
-    )
+    focal, src = cfg.get_focal_px(image_width)
+    saved_b_raw = None
+    # Warn if the saved baseline doesn't match the current one
+    for path in (cfg.CALIB_PATH, cfg.OLD_CALIB_PATH):
+        if path.exists():
+            try:
+                saved_b_raw = float(json.loads(path.read_text()).get("baseline_m", baseline_m))
+            except (OSError, ValueError, json.JSONDecodeError):
+                pass
+            break
+    if saved_b_raw is not None and abs(saved_b_raw - baseline_m) > 0.01:
+        print(
+            f"WARNING: saved calib used baseline {saved_b_raw:.3f} m, "
+            f"now running {baseline_m:.3f} m — press C to recalibrate."
+        )
+    print(f"focal_px={focal:.1f}  ← {src}")
     return focal
+
+
+def save_calib(focal_px: float, baseline_m: float, known_z_m: float,
+               disparity_px: float, image_width: int) -> None:
+    cfg.save_calib(
+        focal_px=focal_px,
+        baseline_m=baseline_m,
+        image_width=image_width,
+        image_height=cfg.NATIVE_HEIGHT,
+        calibrated_at_height_m=known_z_m,
+    )
+    print(f"Saved focal_px={focal_px:.1f}")
 
 
 # ---------------------------------------------------------------------------
@@ -344,10 +327,10 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="Dual-camera stereo distance test")
     parser.add_argument("--left",  type=int, default=0)
     parser.add_argument("--right", type=int, default=1)
-    parser.add_argument("--baseline", type=float, default=BASELINE_M,
-                        help=f"Camera separation in metres (default {BASELINE_M})")
-    parser.add_argument("--known-distance", type=float, default=KNOWN_DISTANCE_M,
-                        help=f"True distance when pressing C (default {KNOWN_DISTANCE_M})")
+    parser.add_argument("--baseline", type=float, default=cfg.BASELINE_M,
+                        help=f"Camera separation in metres (default {cfg.BASELINE_M})")
+    parser.add_argument("--known-distance", type=float, default=5.0,
+                        help="True distance when pressing C to calibrate (default 5.0)")
     parser.add_argument("--focal", type=float, default=None,
                         help="Override focal length in pixels")
     parser.add_argument("--conf", type=float, default=CONFIDENCE,
