@@ -17,9 +17,6 @@ weights/
 .vscode/
 
 # Captured data (keep folder structure, ignore images)
-dataset/**/raw/*.jpg
-dataset/**/raw/*.jpeg
-dataset/**/raw/*.png
 dataset/**/detections/*.jpg
 dataset/**/detections/*.jpeg
 dataset/**/detections/*.png

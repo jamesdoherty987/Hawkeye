@@ -45,8 +45,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 # ── Physical rig ─────────────────────────────────────────────────────────────
 
 BASELINE_M: float = 1.28       # centre-to-centre camera separation (metres)
-H_ANGLE_DEG: float = 25.0      # horizontal inward angle of EACH camera (degrees)
-V_ANGLE_DEG: float = 25.0      # vertical upward angle of EACH camera (degrees)
+H_ANGLE_DEG: float = 0.0       # horizontal inward angle of EACH camera (degrees) — cameras face straight ahead, no toe-in
+V_ANGLE_DEG: float = 55.0      # vertical upward angle of EACH camera (degrees)
 
 # ── Camera spec: B0332 + LN013 NOIR lens ─────────────────────────────────────
 
