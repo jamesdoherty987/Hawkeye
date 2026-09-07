@@ -76,6 +76,12 @@ WINDOW = "Hawkeye Stereo Calibrate — C calibrate | Q save & quit"
 
 SMOOTH_N = 6             # median smoothing window for 3D position
 
+# Football diameter — used ONLY during C-key calibration. Cameras look up at the
+# ball, so left sees the SW (bottom-left) face and right the SE (bottom-right);
+# we nudge YOLO centres from those faces toward the true ball centre.
+BALL_DIAMETER_M = 0.22
+BALL_RADIUS_M = BALL_DIAMETER_M / 2.0
+
 
 # ─── Camera helpers ──────────────────────────────────────────────────────────
 
@@ -197,10 +203,85 @@ def triangulate_3d(
     p1 = np.array([[pt1[0]], [pt1[1]]], dtype=np.float64)
     p2 = np.array([[pt2[0]], [pt2[1]]], dtype=np.float64)
     pts4d = cv2.triangulatePoints(P1, P2, p1, p2)
-    w = float(pts4d[3])
+    w = float(np.asarray(pts4d[3]).reshape(-1)[0])
     if abs(w) < 1e-8:
         return None
     return (pts4d[:3] / w).flatten()
+
+
+def project_world(P: np.ndarray, xyz: np.ndarray) -> tuple[float, float] | None:
+    """Project a 3D world point with a 3×4 projection matrix → pixel (u, v)."""
+    hom = P @ np.array([xyz[0], xyz[1], xyz[2], 1.0], dtype=np.float64)
+    if abs(hom[2]) < 1e-8:
+        return None
+    return float(hom[0] / hom[2]), float(hom[1] / hom[2])
+
+
+def apparent_diameter_px(det: tuple) -> float:
+    """Mean of bbox width and height in pixels."""
+    _cx, _cy, x1, y1, x2, y2, _c = det
+    return 0.5 * (abs(x2 - x1) + abs(y2 - y1))
+
+
+def calib_centres_from_dets(
+    det_l: tuple,
+    det_r: tuple,
+    pos_l: np.ndarray,
+    pos_r: np.ndarray,
+    P1: np.ndarray,
+    P2: np.ndarray,
+) -> tuple[tuple[float, float], tuple[float, float], str, np.ndarray | None]:
+    """
+    Calibration-only viewpoint correction.
+
+    During C the cameras sit on the bar looking UP at the ball, so each view
+    mainly sees the lower outer face of the ball:
+      left cam  → south-west face (bottom + toward left cam)
+      right cam → south-east face (bottom + toward right cam)
+
+    YOLO box centres are assumed biased toward that near face. We estimate the
+    true ball centre P, then for each camera nudge the image point from the
+    projected near-face point toward the projected true centre.
+
+    Returns (pt_l, pt_r, correction_summary, rough_pos).
+    """
+    # ~0.42 R is the centroid offset of a facing hemisphere from the sphere centre
+    face_offset = BALL_RADIUS_M * (4.0 / (3.0 * math.pi))
+
+    rough = triangulate_3d(P1, P2, (det_l[0], det_l[1]), (det_r[0], det_r[1]))
+    if rough is None:
+        return (float(det_l[0]), float(det_l[1])), (float(det_r[0]), float(det_r[1])), \
+            "no rough 3D — skipped SW/SE correction", None
+
+    P = rough.copy()
+    # Prefer a physically plausible calib pose if triangulation is wild
+    if float(P[1]) < 0.05:
+        P[1] = max(float(P[1]), 0.3)
+
+    def correct_one(
+        det: tuple, cam: np.ndarray, Proj: np.ndarray, face_name: str,
+    ) -> tuple[float, float, str]:
+        to_ball = P - cam
+        dist = float(np.linalg.norm(to_ball))
+        if dist < 1e-3:
+            return float(det[0]), float(det[1]), f"{face_name}: skip"
+        direction = to_ball / dist  # camera → ball (near face faces -direction from centre)
+        # Visual centre of the facing (SW/SE underside) hemisphere
+        face_pt = P - face_offset * direction
+        pix_centre = project_world(Proj, P)
+        pix_face = project_world(Proj, face_pt)
+        if pix_centre is None or pix_face is None:
+            return float(det[0]), float(det[1]), f"{face_name}: project fail"
+        du = pix_centre[0] - pix_face[0]
+        dv = pix_centre[1] - pix_face[1]
+        u = float(det[0]) + du
+        v = float(det[1]) + dv
+        return u, v, f"{face_name}: Δu={du:+.1f}px Δv={dv:+.1f}px"
+
+    u_l, v_l, msg_l = correct_one(det_l, pos_l, P1, "L=SW")
+    u_r, v_r, msg_r = correct_one(det_r, pos_r, P2, "R=SE")
+    summary = f"{msg_l}; {msg_r}"
+    return (u_l, v_l), (u_r, v_r), summary, rough
 
 
 def between_posts_verdict(x: float, baseline: float, margin: float = 0.10) -> str:
@@ -335,9 +416,9 @@ def main() -> int:
              f"Default {cfg.V_ANGLE_DEG}",
     )
     parser.add_argument(
-        "--known-height", type=float, default=1.0,
-        help="Height of the ball above the camera bar when pressing C (metres). "
-             "Ball must be held at the midpoint between the two cameras. Default 1.0",
+        "--known-height", type=float, default=0.60,
+        help="Height of the ball ABOVE the camera-bar midpoint when pressing C (metres). "
+             "Hold the ball on the centre line between the two cameras. Default 0.60 (60 cm)",
     )
     parser.add_argument(
         "--focal", type=float, default=None,
@@ -416,11 +497,14 @@ def main() -> int:
             f"\n  H-angle   : {args.h_angle:.1f}°  (each camera rotated inward)"
             f"\n  V-angle   : {args.v_angle:.1f}°  (each camera tilted upward)"
             f"\n  Focal     : {focal_px:.1f} px  ({focal_src})"
+            f"\n  Ball diam : {BALL_DIAMETER_M*100:.0f} cm  (C-key only; SW/SE underside bias)"
             f"\n  Between-posts zone: X in [{-args.baseline/2:.2f}, {args.baseline/2:.2f}] m"
             "\n"
             "C = calibrate focal length:\n"
-            "    Hold ball at the MIDPOINT between cameras at a measured height.\n"
-            "    No need to know the ball size — just measure the height with tape.\n"
+            "    Hold ball at the MIDPOINT between cameras at a measured height\n"
+            "    (measure to the BALL CENTRE, above the camera-bar midpoint).\n"
+            "    Cams look up → left sees SW (bottom-left) face, right sees SE (bottom-right).\n"
+            f"    Uses {BALL_DIAMETER_M*100:.0f} cm diameter to correct that viewpoint bias.\n"
             f"    Current known-height = {args.known_height:.2f} m  (set with --known-height)"
             "\nQ = save & quit\n"
         )
@@ -492,14 +576,12 @@ def main() -> int:
 
             if key in (ord("c"), ord("C")):
                 # ── Focal calibration ────────────────────────────────────────
-                # Hold the ball at the MIDPOINT between the cameras (equidistant
-                # from both) at a measured height above the bar (--known-height).
-                # No need to know the ball's size.
-                #
-                # Method: triangulate with the current focal_px estimate to get
-                # the ball's Y (height). Scale focal_px so triangulated Y matches
-                # the measured known height.
-                #   focal_new = focal_old * (known_height / triangulated_Y)
+                # Hold the ball at the MIDPOINT at --known-height (ball CENTRE).
+                # Cameras look upward, so each mainly sees the lower outer face:
+                #   left  → south-west (bottom + left)
+                #   right → south-east (bottom + right)
+                # Correct those biased YOLO centres using BALL_DIAMETER_M, then
+                # scale focal so triangulated Y matches known height.
                 # ─────────────────────────────────────────────────────────────
                 if det_l is None or det_r is None:
                     print(
@@ -508,27 +590,41 @@ def main() -> int:
                     )
                     continue
 
-                trial_pos = triangulate_3d(
-                    P1, P2, (det_l[0], det_l[1]), (det_r[0], det_r[1])
+                pt_l, pt_r, corr_summary, _rough = calib_centres_from_dets(
+                    det_l, det_r, pos_l, pos_r, P1, P2,
                 )
+                trial_pos = triangulate_3d(P1, P2, pt_l, pt_r)
                 if trial_pos is None:
                     print("C: triangulation failed — cameras may be too parallel for this setup.")
                     continue
 
                 computed_y = float(trial_pos[1])
                 known_h = args.known_height
+                diam_l = apparent_diameter_px(det_l)
+                diam_r = apparent_diameter_px(det_r)
 
-                if abs(computed_y) < 0.01:
+                if computed_y <= 0.05:
                     print(
-                        f"C: computed height is ~0 m (got {computed_y:.3f} m). "
-                        "Check camera angles — if both cameras point directly horizontal "
-                        "they cannot determine height. Try increasing --v-angle."
+                        f"C: REJECTED — computed height is {computed_y:.3f} m "
+                        f"(need clearly positive Y ≈ {known_h:.2f} m).\n"
+                        "   Ball may not be above the bar midpoint, or left/right "
+                        "cameras may be swapped, or --v-angle is wrong.\n"
+                        "   Do not trust this pose — fix placement and try C again."
                     )
                     continue
 
-                # Scale focal proportionally so computed height matches known height
                 scale = known_h / computed_y
-                focal_px = focal_px * scale
+                new_focal = focal_px * scale
+                if not (80.0 <= new_focal <= 4000.0) or scale < 0.05 or scale > 20.0:
+                    print(
+                        f"C: REJECTED — absurd focal update "
+                        f"(computed_Y={computed_y:.3f} m, scale={scale:.3f}, "
+                        f"focal {focal_px:.1f} → {new_focal:.1f}).\n"
+                        "   Check ball is centred between cams at the known height."
+                    )
+                    continue
+
+                focal_px = new_focal
                 P1, P2 = build_projs()
                 positions_3d.clear()
                 save_calib(focal_px, args.baseline, args.h_angle, args.v_angle,
@@ -536,8 +632,10 @@ def main() -> int:
                 print(
                     f"Calibrated: computed_Y={computed_y:.3f} m → known={known_h:.3f} m "
                     f"(scale={scale:.3f}) → focal_px={focal_px:.1f}\n"
+                    f"  SW/SE underside correction ({BALL_DIAMETER_M*100:.0f} cm ball): {corr_summary}\n"
+                    f"  bbox diam L={diam_l:.0f}px R={diam_r:.0f}px\n"
                     f"  Ball 3D position at calibration: "
-                    f"X={trial_pos[0]:.3f} m  Y={trial_pos[1]*scale:.3f} m  Z={trial_pos[2]*scale:.3f} m"
+                    f"X={trial_pos[0]*scale:.3f} m  Y={known_h:.3f} m  Z={trial_pos[2]*scale:.3f} m"
                 )
 
     finally:

@@ -1,0 +1,13 @@
+{
+  "focal_px": 584.5583,
+  "baseline_m": 1.28,
+  "h_angle_deg": 1.0,
+  "v_angle_deg": 45.0,
+  "image_width": 640,
+  "image_height": 480,
+  "hfov_deg": 70.0,
+  "vfov_deg": 47.3,
+  "setup": "converging",
+  "camera": "B0332 + LN013 NOIR",
+  "note": "Edit capture/stereo_config.py for rig geometry. Re-run stereo_calibrate.py (C key) if lens or resolution changes."
+}

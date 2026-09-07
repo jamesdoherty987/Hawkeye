@@ -27,6 +27,13 @@ Usage
       --model models/football_yolov8n.pt --baseline 6.5
   python capture/stereo_record.py --left 0 --right 1 --one-camera  # trigger on any camera
 
+Live stage colours (default ON; disable with --no-stages)
+  green  = motion blob
+  orange = YOLO raw box
+  red    = YOLO rejected by motion gate
+  yellow = accepted after gate
+  blue   = Kalman estimate (+ search radius)
+
 Keys: Q = quit
 """
 
@@ -47,7 +54,7 @@ from ultralytics import YOLO
 
 from auto_exposure import try_set
 from ball_kalman import BallKalman
-from sky_motion import MotionResult, SkyMotionDetector, box_overlaps_motion
+from sky_motion import MotionResult, SkyMotionDetector, box_overlaps_motion, draw_motion_overlay
 import stereo_config as cfg
 
 
@@ -58,10 +65,17 @@ SPORTS_BALL_CLASS = 32
 
 # ── Detection ────────────────────────────────────────────────────────────────
 IMAGE_SIZE = 640
-CONFIDENCE = 0.35
+CONFIDENCE = 0.25
 BACKFILL_CONF = 0.25         # lower confidence for the post-recording re-pass
 HIGH_CONF_NO_MOTION = 0.72   # accept YOLO det even without motion at this conf
 MOTION_GATE_OVERLAP = 0.10   # minimum IoU between det and nearest motion blob
+
+# Stage debug colours (BGR) — live overlay only
+COL_MOTION = (0, 220, 0)       # green  — SkyMotion blobs
+COL_YOLO = (0, 180, 255)       # orange — raw YOLO box (before gate)
+COL_GATED = (0, 255, 255)      # yellow — passed motion gate (accepted)
+COL_KALMAN = (255, 120, 40)    # blue   — Kalman estimate
+COL_REJECT = (0, 0, 220)       # red    — YOLO rejected by gate
 
 # ── Recording ────────────────────────────────────────────────────────────────
 PRE_ROLL_S = 1.5             # pre-roll ring-buffer duration (seconds)
@@ -184,27 +198,37 @@ def detect_pair(
     kalman_r: BallKalman,
     conf: float,
     classes: list[int] | None,
-) -> tuple[tuple | None, tuple | None]:
+    force_yolo: bool = False,
+) -> tuple[tuple | None, tuple | None, tuple | None, tuple | None, bool]:
     """
     Batch-infer both frames in a single model.predict() call.
     Motion gates the result: detections not near any motion blob are dropped
     unless they exceed HIGH_CONF_NO_MOTION.
-    Returns (det_left, det_right) — each is (cx, cy, x1, y1, x2, y2, conf) or None.
+
+    Returns
+    -------
+    det_l, det_r   — gated (accepted) detections
+    raw_l, raw_r   — top YOLO box before the gate (None if YOLO not run / no box)
+    yolo_ran       — True if model.predict was called this frame
     """
     blobs_l = mr_l.blobs if mr_l.ready else []
     blobs_r = mr_r.blobs if mr_r.ready else []
     need_l = bool(blobs_l) or kalman_l.initialized
     need_r = bool(blobs_r) or kalman_r.initialized
-    if not (need_l or need_r):
-        return None, None
+    run_yolo = force_yolo or need_l or need_r
+    if not run_yolo:
+        return None, None, None, None, False
 
     kw: dict = dict(conf=conf, imgsz=IMAGE_SIZE, verbose=False)
     if classes:
         kw["classes"] = classes
     results = model.predict([frame_l, frame_r], **kw)
-    det_l = _motion_gate(_parse_best(results[0]), blobs_l) if need_l else None
-    det_r = _motion_gate(_parse_best(results[1]), blobs_r) if need_r else None
-    return det_l, det_r
+    raw_l = _parse_best(results[0])
+    raw_r = _parse_best(results[1])
+    # Gate only when that camera would normally be evaluated (unless forcing viz).
+    det_l = _motion_gate(raw_l, blobs_l) if (need_l or force_yolo) else None
+    det_r = _motion_gate(raw_r, blobs_r) if (need_r or force_yolo) else None
+    return det_l, det_r, raw_l, raw_r, True
 
 
 # ─── Backfill: re-run YOLO on every recorded frame to build complete paths ───
@@ -312,14 +336,82 @@ def paint_det(
     frame: np.ndarray,
     det: tuple | None,
     color: tuple[int, int, int],
+    label: str | None = None,
+    thickness: int = 2,
 ) -> None:
     if det is None:
         return
     cx, cy, x1, y1, x2, y2, conf = det
-    cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, 2)
+    cv2.rectangle(frame, (int(x1), int(y1)), (int(x2), int(y2)), color, thickness)
     cv2.circle(frame, (int(cx), int(cy)), 5, color, -1, cv2.LINE_AA)
-    cv2.putText(frame, f"{conf:.2f}", (int(x1), max(int(y1) - 6, 12)),
-                cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1, cv2.LINE_AA)
+    text = label if label else f"{conf:.2f}"
+    if label:
+        text = f"{label} {conf:.2f}"
+    cv2.putText(frame, text, (int(x1), max(int(y1) - 6, 12)),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+
+
+def paint_kalman(
+    frame: np.ndarray,
+    kalman: BallKalman,
+    color: tuple[int, int, int] = COL_KALMAN,
+) -> None:
+    pos = kalman.position
+    if pos is None:
+        return
+    x, y = int(pos[0]), int(pos[1])
+    r = int(kalman.search_radius())
+    cv2.circle(frame, (x, y), 8, color, 2, cv2.LINE_AA)
+    cv2.drawMarker(frame, (x, y), color, cv2.MARKER_CROSS, 16, 2, cv2.LINE_AA)
+    cv2.circle(frame, (x, y), r, color, 1, cv2.LINE_AA)
+    cv2.putText(frame, "kalman", (x + 10, y - 10),
+                cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1, cv2.LINE_AA)
+
+
+def paint_stage_overlay(
+    frame: np.ndarray,
+    motion: MotionResult,
+    raw: tuple | None,
+    gated: tuple | None,
+    kalman: BallKalman,
+    yolo_ran: bool,
+) -> None:
+    """Draw motion / raw YOLO / gate / Kalman with distinct colours."""
+    if motion.ready:
+        draw_motion_overlay(frame, motion)
+    else:
+        cv2.putText(frame, "motion warming up…", (8, 20),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, COL_MOTION, 1, cv2.LINE_AA)
+
+    if not yolo_ran:
+        cv2.putText(frame, "YOLO skipped (no motion/track)", (8, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, COL_YOLO, 1, cv2.LINE_AA)
+    elif raw is not None and gated is None:
+        paint_det(frame, raw, COL_REJECT, label="yolo REJECT", thickness=2)
+    elif raw is not None:
+        paint_det(frame, raw, COL_YOLO, label="yolo", thickness=1)
+
+    if gated is not None:
+        paint_det(frame, gated, COL_GATED, label="gated", thickness=2)
+
+    paint_kalman(frame, kalman)
+
+
+def draw_stage_legend(combo: np.ndarray) -> None:
+    """Colour key in the top-left of the side-by-side panel."""
+    rows = [
+        (COL_MOTION, "motion blob"),
+        (COL_YOLO, "YOLO raw"),
+        (COL_REJECT, "YOLO rejected by gate"),
+        (COL_GATED, "accepted (gated)"),
+        (COL_KALMAN, "Kalman estimate"),
+    ]
+    x0, y0 = 12, 18
+    for i, (color, name) in enumerate(rows):
+        y = y0 + i * 18
+        cv2.rectangle(combo, (x0, y - 10), (x0 + 14, y + 2), color, -1)
+        cv2.putText(combo, name, (x0 + 20, y),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
 
 
 def make_panel(frame_l: np.ndarray, frame_r: np.ndarray) -> np.ndarray:
@@ -424,6 +516,10 @@ def main() -> int:
     parser.add_argument("--one-camera", action="store_true",
                         help="Start recording when ANY camera sees the ball "
                              "(default: require both cameras to see it)")
+    parser.add_argument(
+        "--no-stages", action="store_true",
+        help="Hide colour-coded stage boxes (motion / YOLO / gate / Kalman)",
+    )
     parser.add_argument("--list", action="store_true",
                         help="List available camera indices 0–5 and exit")
     args = parser.parse_args()
@@ -457,10 +553,13 @@ def main() -> int:
 
     model, classes = load_model(model_path)
     require_both = not args.one_camera
+    show_stages = not args.no_stages
 
     print(
         f"\nBaseline={args.baseline:.2f} m  |  left={args.left}  right={args.right}\n"
         f"Trigger: {'BOTH cameras' if require_both else 'ANY camera'}  |  conf={args.conf:.2f}\n"
+        f"Stage boxes: {'ON' if show_stages else 'OFF'}  "
+        f"(green=motion  orange=YOLO  red=rejected  yellow=gated  blue=Kalman)\n"
         f"Recordings → {OUT_DIR}\n"
         "Q = quit\n"
     )
@@ -535,9 +634,10 @@ def main() -> int:
                 preroll_l.append(frame_l.copy())
                 preroll_r.append(frame_r.copy())
 
-                det_l, det_r = detect_pair(
+                det_l, det_r, raw_l, raw_r, yolo_ran = detect_pair(
                     model, frame_l, frame_r, mr_l, mr_r,
                     kalman_l, kalman_r, args.conf, classes,
+                    force_yolo=show_stages,
                 )
                 if det_l:
                     kalman_l.update(det_l[0], det_l[1])
@@ -570,9 +670,15 @@ def main() -> int:
 
                 disp_l = frame_l.copy()
                 disp_r = frame_r.copy()
-                paint_det(disp_l, det_l, TRAIL_L)
-                paint_det(disp_r, det_r, TRAIL_R)
+                if show_stages:
+                    paint_stage_overlay(disp_l, mr_l, raw_l, det_l, kalman_l, yolo_ran)
+                    paint_stage_overlay(disp_r, mr_r, raw_r, det_r, kalman_r, yolo_ran)
+                else:
+                    paint_det(disp_l, det_l, TRAIL_L)
+                    paint_det(disp_r, det_r, TRAIL_R)
                 combo = make_panel(disp_l, disp_r)
+                if show_stages:
+                    draw_stage_legend(combo)
                 add_state_overlay(
                     combo, State.IDLE,
                     f"LOOKING FOR BALL  ({'both' if require_both else 'any'} camera)",
@@ -587,9 +693,10 @@ def main() -> int:
                 frozen_l = frame_l.copy()
                 frozen_r = frame_r.copy()
 
-                det_l, det_r = detect_pair(
+                det_l, det_r, raw_l, raw_r, yolo_ran = detect_pair(
                     model, frame_l, frame_r, mr_l, mr_r,
                     kalman_l, kalman_r, args.conf, classes,
+                    force_yolo=show_stages,
                 )
                 frame_idx = len(record_l) - 1
                 if det_l:
@@ -625,14 +732,20 @@ def main() -> int:
                         kalman_l.reset()
                         kalman_r.reset()
 
-                # Display live growing trail
+                # Display live growing trail + stage boxes
                 disp_l = frame_l.copy()
                 disp_r = frame_r.copy()
                 draw_trail(disp_l, live_path_l, TRAIL_L, up_to=frame_idx)
                 draw_trail(disp_r, live_path_r, TRAIL_R, up_to=frame_idx)
-                paint_det(disp_l, det_l, TRAIL_L)
-                paint_det(disp_r, det_r, TRAIL_R)
+                if show_stages:
+                    paint_stage_overlay(disp_l, mr_l, raw_l, det_l, kalman_l, yolo_ran)
+                    paint_stage_overlay(disp_r, mr_r, raw_r, det_r, kalman_r, yolo_ran)
+                else:
+                    paint_det(disp_l, det_l, TRAIL_L)
+                    paint_det(disp_r, det_r, TRAIL_R)
                 combo = make_panel(disp_l, disp_r)
+                if show_stages:
+                    draw_stage_legend(combo)
                 add_state_overlay(combo, State.TRACKING, f"● REC  {len(record_l)} frames")
                 cv2.imshow(WINDOW, combo)
 

@@ -50,6 +50,14 @@ class BallKalman:
     def speed_px(self) -> float:
         return self._speed_px
 
+    @property
+    def position(self) -> tuple[float, float] | None:
+        """Current filter estimate (x, y), or None if not initialized."""
+        if not self.initialized:
+            return None
+        state = self._kf.statePost
+        return float(state[0]), float(state[1])
+
     def predict(self) -> tuple[float, float] | None:
         if not self.initialized:
             return None
