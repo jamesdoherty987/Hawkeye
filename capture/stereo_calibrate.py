@@ -149,8 +149,12 @@ def make_proj_matrix(
       Camera Y = downward in image
       Camera Z = forward (depth)
 
-    h_deg: horizontal inward angle (positive = look toward +X / inward for left camera)
+    h_deg: horizontal aim (positive = look toward +X; ~90° = across goal)
     v_deg: vertical upward angle  (positive = look upward)
+
+    Intrinsics use separate fx/fy from stereo_config mounted FOVs (sideways:
+    ~47.3° horizontal, ~70° vertical). `focal_px` scales both so a C-key
+    calibration still applies.
     """
     h = math.radians(h_deg)
     v = math.radians(v_deg)
@@ -180,10 +184,15 @@ def make_proj_matrix(
     # Translation: t = R_w2c @ (-cam_pos_world)
     t = R_w2c @ (-cam_pos_world)
 
-    # Intrinsic matrix (principal point at image centre)
+    # Intrinsics: fx from image-HFOV, fy from image-VFOV (sideways mount)
+    fx_spec, fy_spec = cfg.focal_axes(img_w, img_h)
+    # Scale both axes by calibrated focal / spec fx (single C-key scalar)
+    scale = (focal_px / fx_spec) if fx_spec > 1e-6 else 1.0
+    fx = fx_spec * scale
+    fy = fy_spec * scale
     cx, cy = img_w / 2.0, img_h / 2.0
-    K = np.array([[focal_px, 0.0, cx],
-                  [0.0, focal_px, cy],
+    K = np.array([[fx, 0.0, cx],
+                  [0.0, fy, cy],
                   [0.0, 0.0, 1.0]], dtype=np.float64)
 
     Rt = np.hstack([R_w2c, t.reshape(3, 1)])
