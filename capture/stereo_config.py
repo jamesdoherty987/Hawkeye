@@ -65,6 +65,10 @@ DISTORTION_PCT: float = 1.5
 # and world-up maps toward decreasing image Y when looking along cam_z).
 
 CAMERAS_SIDEWAYS: bool = True
+# Landscape frames (w > h) are rotated this way so the 70° FOV is vertical.
+# 90 = clockwise, 270 = counter-clockwise, 0 = do not rotate.
+# Skip when the frame is already portrait (h >= w).
+SIDEWAYS_ROTATE_DEG: int = 90
 
 # FOV in the CAPTURED image (swapped vs datasheet because of sideways mount)
 HFOV_DEG: float = DATASHEET_VFOV_DEG   # ≈47.3° left–right in image
@@ -192,6 +196,8 @@ def print_summary(focal_px: float, focal_src: str) -> None:
         f"  In image  : HFOV {HFOV_DEG}°  VFOV {VFOV_DEG}°  "
         f"(70° is UP–DOWN)\n"
         f"  Native res: {NATIVE_WIDTH}×{NATIVE_HEIGHT} px  (portrait after rotate)\n"
+        f"  Rotate    : {SIDEWAYS_ROTATE_DEG}° "
+        f"{'(skip if already portrait)' if CAMERAS_SIDEWAYS else '(disabled)'}\n"
         f"  Baseline  : {BASELINE_M:.3f} m\n"
         f"  H-angle   : {H_ANGLE_DEG:.1f}°  (across goal → far post)\n"
         f"  V-angle   : {V_ANGLE_DEG:.1f}°  (up from horizontal)\n"
