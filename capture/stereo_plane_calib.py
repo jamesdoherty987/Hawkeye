@@ -13,9 +13,8 @@ Assumptions
   Cameras share that X/Y but sit CAM_BEHIND_POST_M behind the wood (Z < 0).
   Crossbar height ≈ camera height (Y = 0).
 
-  Config aim (edit stereo_config.py):
-    H_ANGLE ≈ 90°  → each camera looks across the goal toward the far post
-    V_ANGLE ≈ 55°  → tilted upward
+  LEFT / RIGHT are from BEHIND the goal, looking into the field
+  (goalkeeper's left/right). N on each camera points into the FIELD.
 
 Controls
 ────────
@@ -23,6 +22,7 @@ Controls
   Click RIGHT panel = mark a point on the RIGHT camera image
 
   F = next clicks are FAR post (default)
+  K = lock the plane H-angle to those far-post clicks
   N = next clicks are NEAR post
   C = clear all click marks
 
@@ -30,7 +30,10 @@ Controls
   - / = = decrease / increase V_ANGLE by 1°
   , / . = decrease / increase plane height extension (metres)
   R     = reset angles to stereo_config defaults
-  B     = toggle ball detection (COCO sports-ball) + plane-side readout
+  B     = toggle ball detection (on by default)
+          BLUE flash = ball seen, still in front of the plane
+          GREEN      = ball has gone THROUGH between the posts
+          RED        = ball has gone THROUGH but wide of the posts
   D     = toggle landmark distance labels on the plane
   S     = save plane overlay params → exports/stereo/plane.json
   L     = load plane.json if present
@@ -73,7 +76,12 @@ from ultralytics import YOLO
 
 from auto_exposure import try_set
 import stereo_config as cfg
-from stereo_calibrate import make_proj_matrix, project_world, triangulate_3d
+from stereo_calibrate import (
+    make_proj_matrix,
+    project_world,
+    triangulate_3d,
+    calib_centres_from_dets,
+)
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -84,9 +92,12 @@ COCO_MODEL = "yolov8n.pt"
 SPORTS_BALL_CLASS = 32
 IMAGE_SIZE = 640
 CONFIDENCE = 0.30
-WINDOW = "Hawkeye Plane Calib — click posts | [ ] H | - = V | D labels | B ball | S save | Q"
+WINDOW = "Hawkeye Plane"
 
-# Drawing
+PLANE_CROSS_M = 0.05
+POST_MARGIN_M = 0.02          # extra width beyond ±baseline/2 still called "between"
+REPROJ_MAX_PX = 40.0          # reject 3D if it doesn't land on both detections
+CALL_LATCH_S = 1.2
 COL_GRID = (80, 200, 80)
 COL_POST = (0, 255, 255)
 COL_BAR = (0, 180, 255)
@@ -97,6 +108,9 @@ COL_BALL = (0, 255, 255)
 COL_STATUS = (220, 220, 220)
 COL_DEBUG = (180, 255, 255)
 COL_DIST = (255, 255, 100)
+COL_CALL_BLUE = (255, 90, 20)     # BGR — in field, not yet through
+COL_CALL_GREEN = (0, 255, 80)     # through + between posts
+COL_CALL_RED = (0, 0, 255)        # through + wide
 
 
 def dist3(a: np.ndarray, b: np.ndarray) -> float:
@@ -236,6 +250,14 @@ def rotate_label(deg: int) -> str:
     return "rotate=90 CW"
 
 
+def draw_camera_hud(img: np.ndarray, which_cam: str, rotate_deg: int) -> None:
+    col = COL_POST if which_cam == "L" else COL_CLICK_NEAR
+    put_label(img, "L" if which_cam == "L" else "R", (8, 26), col, 0.75, 2)
+    h, w = img.shape[:2]
+    if h < w:
+        put_label(img, "O rotate", (8, h - 14), (0, 0, 255), 0.5, 2)
+
+
 def load_still(path: Path) -> np.ndarray:
     """Read a still; imdecode handles Windows paths that cv2.imread can miss."""
     img: np.ndarray | None = None
@@ -362,54 +384,46 @@ def draw_goal_plane(
     grid_nx: int = 6,
     grid_ny: int = 8,
     show_point_labels: bool = True,
+    y_vis_min: float = 0.0,
 ) -> None:
-    """Project uprights, crossbar, upward grid, and per-point distance labels."""
+    """Draw the visible part of the goal plane. The bar is often below the FOV."""
     half = baseline_m / 2.0
-    corners = goal_corners(baseline_m, extend_up_m)
+    y0 = max(0.0, float(y_vis_min))
+    y1 = max(y0 + 0.2, float(extend_up_m))
 
-    # Uprights (extended above bar)
-    draw_line_world(img, P, corners["bar_left"], corners["left_top"], COL_EXT, 2)
-    draw_line_world(img, P, corners["bar_right"], corners["right_top"], COL_EXT, 2)
-    draw_line_world(img, P, corners["left_base"], corners["bar_left"], COL_POST, 3)
-    draw_line_world(img, P, corners["right_base"], corners["bar_right"], COL_POST, 3)
-    draw_line_world(img, P, corners["bar_left"], corners["bar_right"], COL_BAR, 3)
-    draw_line_world(img, P, corners["left_top"], corners["right_top"], COL_GRID, 1)
+    # Visible uprights (from lowest ray up — not from the unseen bar)
+    draw_line_world(img, P, np.array([-half, y0, 0.0]), np.array([-half, y1, 0.0]), COL_POST, 3)
+    draw_line_world(img, P, np.array([half, y0, 0.0]), np.array([half, y1, 0.0]), COL_POST, 3)
+    draw_line_world(img, P, np.array([-half, y0, 0.0]), np.array([half, y0, 0.0]), COL_BAR, 2)
+    draw_line_world(img, P, np.array([-half, y1, 0.0]), np.array([half, y1, 0.0]), COL_GRID, 1)
 
     for i in range(grid_nx + 1):
         x = -half + (baseline_m * i / grid_nx)
-        a = np.array([x, 0.0, 0.0])
-        b = np.array([x, extend_up_m, 0.0])
+        a = np.array([x, y0, 0.0])
+        b = np.array([x, y1, 0.0])
         draw_line_world(img, P, a, b, COL_GRID, 1, n_seg=16)
 
     for j in range(1, grid_ny + 1):
-        y = extend_up_m * j / grid_ny
+        y = y0 + (y1 - y0) * j / grid_ny
         a = np.array([-half, y, 0.0])
         b = np.array([half, y, 0.0])
         draw_line_world(img, P, a, b, COL_GRID, 1, n_seg=16)
 
+    uv = project_safe(P, np.array([0.0, y0, 0.0]))
+    if uv is not None:
+        put_label(img, f"FOV from {y0:.2f}m above bar", (uv[0] + 6, uv[1] + 16), COL_DEBUG, 0.4, 1)
+
     if not show_point_labels:
         return
 
-    # Landmark heights on each post: bar, lowest-ray hit, mid, top of extension
-    ray_deg, h_low, _slant = cfg.lowest_visible_on_far_post(baseline_m)
-    h_low = max(0.05, h_low)  # avoid sitting exactly on the bar label
-    landmarks: list[tuple[str, np.ndarray]] = [
-        ("L-bar", np.array([-half, 0.0, 0.0])),
-        ("R-bar", np.array([half, 0.0, 0.0])),
-        ("mid-bar", np.array([0.0, 0.0, 0.0])),
-        (f"L@{h_low:.2f}m", np.array([-half, h_low, 0.0])),
-        (f"R@{h_low:.2f}m", np.array([half, h_low, 0.0])),
-        ("L-mid", np.array([-half, extend_up_m * 0.5, 0.0])),
-        ("R-mid", np.array([half, extend_up_m * 0.5, 0.0])),
-        ("L-top", np.array([-half, extend_up_m, 0.0])),
-        ("R-top", np.array([half, extend_up_m, 0.0])),
-        ("mid-top", np.array([0.0, extend_up_m, 0.0])),
-    ]
-    # From each camera, the FAR post is the important one — bold those first
     far_name = "R" if which_cam == "L" else "L"
+    landmarks: list[tuple[str, np.ndarray]] = [
+        (f"{far_name}@{y0:.2f}m", np.array([half if far_name == "R" else -half, y0, 0.0])),
+        (f"{far_name}-mid", np.array([half if far_name == "R" else -half, (y0 + y1) * 0.5, 0.0])),
+        (f"{far_name}-top", np.array([half if far_name == "R" else -half, y1, 0.0])),
+    ]
     for name, xyz in landmarks:
-        if name.startswith(far_name) or name.startswith("mid") or "@" in name:
-            label_world_point(img, P, xyz, pos_l, pos_r, name, which_cam)
+        label_world_point(img, P, xyz, pos_l, pos_r, name, which_cam)
 
 
 def fit_height(img: np.ndarray, target_h: int) -> np.ndarray:
@@ -427,14 +441,20 @@ def side_by_side_full(left: np.ndarray, right: np.ndarray) -> tuple[np.ndarray, 
     return np.hstack([fl, fr]), fl.shape[1]
 
 
-def attach_status_bar(img: np.ndarray, lines: list[str]) -> tuple[np.ndarray, int]:
+def attach_status_bar(
+    img: np.ndarray,
+    lines: list[str],
+    accent_color: tuple[int, int, int] | None = None,
+    accent_line: str = "",
+) -> tuple[np.ndarray, int]:
     """Append a status strip under the image so UI never covers the picture."""
     bar_h = 20 * max(len(lines), 1) + 12
     bar = np.zeros((bar_h, img.shape[1], 3), dtype=img.dtype)
     for i, line in enumerate(lines):
+        col = accent_color if (accent_line and line == accent_line) else COL_STATUS
         cv2.putText(
             bar, line, (10, 18 + i * 20),
-            cv2.FONT_HERSHEY_SIMPLEX, 0.48, COL_STATUS, 1, cv2.LINE_AA,
+            cv2.FONT_HERSHEY_SIMPLEX, 0.48, col, 1, cv2.LINE_AA,
         )
     return np.vstack([img, bar]), bar_h
 
@@ -573,13 +593,29 @@ class ClickState:
         self.near_r = [(int(p[0]), int(p[1])) for p in data.get("near_right", [])]
 
 
-# ─── Ball (optional) ─────────────────────────────────────────────────────────
+# ─── Ball (YOLO + triangulation vs the Z=0 plane) ────────────────────────────
 
-def detect_both(model: YOLO, frame_l, frame_r, conf: float):
-    results = model.predict(
-        [frame_l, frame_r], conf=conf, classes=[SPORTS_BALL_CLASS],
-        imgsz=IMAGE_SIZE, verbose=False,
-    )
+def default_ball_model() -> str:
+    custom = PROJECT_ROOT / "models" / "football_yolov8n.pt"
+    return str(custom) if custom.exists() else COCO_MODEL
+
+
+def load_ball_model(model_str: str) -> tuple[YOLO, list[int] | None]:
+    path = Path(model_str)
+    if not path.is_absolute():
+        full = PROJECT_ROOT / path
+        if full.exists():
+            path = full
+    is_coco = path.name == COCO_MODEL
+    print(f"Loading {'COCO sports-ball' if is_coco else 'custom'} model: {path}")
+    return YOLO(str(path)), ([SPORTS_BALL_CLASS] if is_coco else None)
+
+
+def detect_both(model: YOLO, frame_l, frame_r, conf: float, classes: list[int] | None):
+    kw: dict = dict(conf=conf, imgsz=IMAGE_SIZE, verbose=False)
+    if classes:
+        kw["classes"] = classes
+    results = model.predict([frame_l, frame_r], **kw)
 
     def best(res):
         if res.boxes is None or len(res.boxes) == 0:
@@ -595,12 +631,186 @@ def detect_both(model: YOLO, frame_l, frame_r, conf: float):
     return best(results[0]), best(results[1])
 
 
-def plane_side_label(z: float, eps: float = 0.05) -> str:
+def plane_side_label(z: float, eps: float = PLANE_CROSS_M) -> str:
     if z > eps:
-        return f"INTO FIELD  Z={z:+.2f} m"
+        return "field"
     if z < -eps:
-        return f"BEHIND GOAL  Z={z:+.2f} m"
-    return f"ON PLANE  Z={z:+.2f} m"
+        return "through"
+    return "on-plane"
+
+
+def point_to_post_px(
+    P: np.ndarray,
+    click: tuple[int, int],
+    post_x: float,
+    y0: float,
+    y1: float,
+    n: int = 32,
+) -> float:
+    """Pixel distance from a click to the projected far-post line."""
+    best = 1e9
+    cx, cy = float(click[0]), float(click[1])
+    for i in range(n + 1):
+        y = y0 + (y1 - y0) * i / n
+        uv = project_safe(P, np.array([post_x, y, 0.0]))
+        if uv is None:
+            continue
+        best = min(best, math.hypot(uv[0] - cx, uv[1] - cy))
+    return best
+
+
+def lock_h_to_far_clicks(
+    clicks: ClickState,
+    pos_l: np.ndarray,
+    pos_r: np.ndarray,
+    h_angle: float,
+    v_angle: float,
+    focal_l: float,
+    focal_r: float,
+    img_w: int,
+    img_h: int,
+    img_w_r: int,
+    img_h_r: int,
+    baseline: float,
+    y0: float,
+    y1: float,
+) -> tuple[float, float]:
+    """
+    Sweep H-angle so the drawn far post sits on the latest FAR clicks.
+    Left click → right post; right click → left post.
+    """
+    half = baseline / 2.0
+    pt_l = clicks.far_l[-1] if clicks.far_l else None
+    pt_r = clicks.far_r[-1] if clicks.far_r else None
+    if pt_l is None and pt_r is None:
+        return h_angle, -1.0
+
+    lo = max(1.0, h_angle - 20.0)
+    hi = min(90.0, h_angle + 20.0)
+    best_h = h_angle
+    best_err = 1e9
+    step = 0.5
+    h = lo
+    while h <= hi + 1e-9:
+        P1 = make_proj_matrix(pos_l, +h, v_angle, focal_l, img_w, img_h)
+        P2 = make_proj_matrix(pos_r, -h, v_angle, focal_r, img_w_r, img_h_r)
+        err = 0.0
+        n = 0
+        if pt_l is not None:
+            err += point_to_post_px(P1, pt_l, +half, y0, y1)
+            n += 1
+        if pt_r is not None:
+            err += point_to_post_px(P2, pt_r, -half, y0, y1)
+            n += 1
+        mean = err / max(n, 1)
+        if mean < best_err:
+            best_err = mean
+            best_h = h
+        h += step
+    return best_h, best_err
+
+
+def reproj_err_px(P: np.ndarray, xyz: np.ndarray, uv: tuple[float, float]) -> float:
+    pred = project_world(P, xyz)
+    if pred is None:
+        return 1e9
+    return math.hypot(pred[0] - uv[0], pred[1] - uv[1])
+
+
+def inside_posts(x: float, baseline: float, radius: float = 0.0) -> bool:
+    """True only if the whole ball (centre ± radius) sits between the posts."""
+    return abs(x) + radius <= baseline / 2.0 + POST_MARGIN_M
+
+
+def live_ball_call(
+    x: float,
+    z: float,
+    baseline: float,
+    radius: float = 0.0,
+) -> str:
+    """
+    Score uses the 3D centre, expanded by ball radius.
+    A 22 cm ball on a 1 m goal is IN only if |X| + 0.11 m ≤ 0.50 m.
+    """
+    in_posts = inside_posts(x, baseline, radius)
+    if z > PLANE_CROSS_M:
+        return "approaching" if in_posts else "wide_field"
+    if in_posts:
+        return "goal"
+    return "wide"
+
+
+def update_call_latch(
+    call: str,
+    z: float | None,
+    now: float,
+    state: dict,
+) -> str:
+    """Latch GOAL/WIDE briefly after a crossing, but never if the ball is gone or 1-cam."""
+    if call in ("none", "one", "reject"):
+        if call == "none":
+            state["prev_z"] = None
+            state["latch"] = None
+        return call
+
+    prev_z = state.get("prev_z")
+    if (
+        z is not None
+        and prev_z is not None
+        and prev_z > PLANE_CROSS_M
+        and z <= PLANE_CROSS_M
+        and call in ("goal", "wide")
+    ):
+        state["latch"] = call
+        state["latch_until"] = now + CALL_LATCH_S
+        print(f"  Plane crossed → {call.upper()}")
+    state["prev_z"] = z
+
+    # A later WIDE reading must not keep a stale GOAL flash
+    if call == "wide":
+        state["latch"] = "wide"
+        return "wide"
+
+    latch = state.get("latch")
+    until = float(state.get("latch_until") or 0.0)
+    if latch in ("goal", "wide") and now < until:
+        return latch
+    return call
+
+
+def call_style(call: str) -> tuple[tuple[int, int, int], str, bool]:
+    """colour, short label, pulse. Empty label = do not highlight."""
+    if call == "approaching":
+        return COL_CALL_BLUE, "IN FIELD", True
+    if call == "wide_field":
+        return COL_CALL_BLUE, "WIDE", True
+    if call == "goal":
+        return COL_CALL_GREEN, "GOAL", False
+    if call == "wide":
+        return COL_CALL_RED, "WIDE", False
+    return (80, 80, 80), "", False
+
+
+def draw_flash_border(img: np.ndarray, color: tuple[int, int, int], now: float, pulse: bool) -> None:
+    h, w = img.shape[:2]
+    if h < 8 or w < 8:
+        return
+    if pulse:
+        thick = 6 + int(6 * (0.5 + 0.5 * math.sin(now * 14.0)))
+    else:
+        thick = 10
+    thick = max(4, min(thick, min(h, w) // 8))
+    cv2.rectangle(img, (2, 2), (w - 3, h - 3), color, thick)
+
+
+def paint_ball_box(img: np.ndarray, det, color: tuple[int, int, int], label: str) -> None:
+    if det is None:
+        return
+    x1, y1, x2, y2 = map(int, det[3])
+    cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+    cv2.circle(img, (int(det[0]), int(det[1])), 5, color, -1)
+    if label:
+        put_label(img, label, (x1, max(20, y1 - 8)), color, 0.48, 2)
 
 
 def paint_ball_pair(
@@ -613,41 +823,68 @@ def paint_ball_pair(
     pos_l: np.ndarray,
     pos_r: np.ndarray,
     baseline: float,
-) -> str:
-    """Draw YOLO boxes and return the XYZ status line (empty if incomplete)."""
-    if det_l is not None:
-        x1, y1, x2, y2 = map(int, det_l[3])
-        cv2.rectangle(disp_l, (x1, y1), (x2, y2), COL_BALL, 2)
-        cv2.circle(disp_l, (int(det_l[0]), int(det_l[1])), 5, COL_BALL, -1)
-    if det_r is not None:
-        x1, y1, x2, y2 = map(int, det_r[3])
-        cv2.rectangle(disp_r, (x1, y1), (x2, y2), COL_BALL, 2)
-        cv2.circle(disp_r, (int(det_r[0]), int(det_r[1])), 5, COL_BALL, -1)
+    now: float,
+    latch_state: dict,
+) -> tuple[str, str]:
+    """Draw the ball AFTER the grid. No coloured frame unless 3D from BOTH cameras."""
+    if det_l is None and det_r is None:
+        update_call_latch("none", None, now, latch_state)
+        return "", "none"
+
     if det_l is None or det_r is None:
-        return ""
-    pos3d = triangulate_3d(P1, P2, (det_l[0], det_l[1]), (det_r[0], det_r[1]))
+        update_call_latch("one", None, now, latch_state)
+        paint_ball_box(disp_l, det_l, COL_BALL, "")
+        paint_ball_box(disp_r, det_r, COL_BALL, "")
+        which = "L only" if det_r is None else "R only"
+        half = baseline / 2.0
+        return f"dbg  {which}  (need both for 3D)  posts ±{half:.2f}m", "one"
+
+    pt_l, pt_r, _corr, _rough = calib_centres_from_dets(
+        det_l, det_r, pos_l, pos_r, P1, P2,
+    )
+    pos3d = triangulate_3d(P1, P2, pt_l, pt_r)
     if pos3d is None:
-        return ""
+        update_call_latch("reject", None, now, latch_state)
+        paint_ball_box(disp_l, det_l, COL_BALL, "")
+        paint_ball_box(disp_r, det_r, COL_BALL, "")
+        return "dbg  both seen  3D failed", "reject"
+
     x, y, z = map(float, pos3d)
-    d_l = dist3(pos3d, pos_l)
-    d_r = dist3(pos3d, pos_r)
-    side = plane_side_label(z)
-    between = abs(x) <= baseline / 2.0 + 0.05
-    above = y > -0.05
-    put_label(
-        disp_l, f"ball dL={d_l:.2f} dR={d_r:.2f}",
-        (int(det_l[0]) + 8, int(det_l[1]) + 20), COL_BALL, 0.45, 1,
+    err_l = reproj_err_px(P1, pos3d, pt_l)
+    err_r = reproj_err_px(P2, pos3d, pt_r)
+    if err_l > REPROJ_MAX_PX or err_r > REPROJ_MAX_PX:
+        update_call_latch("reject", None, now, latch_state)
+        paint_ball_box(disp_l, det_l, COL_BALL, "")
+        paint_ball_box(disp_r, det_r, COL_BALL, "")
+        return (
+            f"dbg  3D mismatch  reproj L{err_l:.0f}px R{err_r:.0f}px  "
+            f"(ignore call)"
+        ), "reject"
+
+    radius = cfg.BALL_RADIUS_M
+    raw = live_ball_call(x, z, baseline, radius)
+    call = update_call_latch(raw, z, now, latch_state)
+    color, banner, pulse = call_style(call)
+    if banner:
+        paint_ball_box(disp_l, det_l, color, banner)
+        paint_ball_box(disp_r, det_r, color, banner)
+        draw_flash_border(disp_l, color, now, pulse)
+        draw_flash_border(disp_r, color, now, pulse)
+    else:
+        paint_ball_box(disp_l, det_l, COL_BALL, "")
+        paint_ball_box(disp_r, det_r, COL_BALL, "")
+
+    half = baseline / 2.0
+    in_posts = inside_posts(x, baseline, radius)
+    x0, x1 = x - radius, x + radius
+    line = (
+        f"dbg  X={x:+.2f} ball[{x0:+.2f},{x1:+.2f}] posts±{half:.2f} "
+        f"{'IN' if in_posts else 'OUT'}  "
+        f"Y={y:+.2f}  Z={z:+.2f} ({plane_side_label(z)})  "
+        f"reproj {err_l:.0f}/{err_r:.0f}px"
+        + (f"  {banner}" if banner else "")
     )
-    put_label(
-        disp_r, f"ball dL={d_l:.2f} dR={d_r:.2f}",
-        (int(det_r[0]) + 8, int(det_r[1]) + 20), COL_BALL, 0.45, 1,
-    )
-    return (
-        f"Ball XYZ=({x:+.2f},{y:+.2f},{z:+.2f})  "
-        f"dL={d_l:.2f}m dR={d_r:.2f}m  |  {side}  |  "
-        f"{'BETWEEN' if between else 'OUTSIDE'}  "
-        f"{'ABOVE' if above else 'BELOW'}"
-    )
+    return line, call
 
 
 # ─── Save / load ─────────────────────────────────────────────────────────────
@@ -749,6 +986,12 @@ def main() -> int:
         help="Rotate landscape frames: 90=CW, 270=CCW, 0=off "
              f"(default {cfg.SIDEWAYS_ROTATE_DEG} from stereo_config)",
     )
+    parser.add_argument(
+        "--model", type=str, default=None,
+        help="Ball detector. Default: models/football_yolov8n.pt if present, else yolov8n.pt",
+    )
+    parser.add_argument("--conf", type=float, default=CONFIDENCE)
+    parser.add_argument("--no-ball", action="store_true", help="Start with ball detection off (B toggles)")
     parser.add_argument("--list", action="store_true")
     args = parser.parse_args()
 
@@ -796,11 +1039,13 @@ def main() -> int:
     if rotate_deg not in (0, 90, 270):
         rotate_deg = 90
     clicks = ClickState()
-    ball_on = False
-    show_labels = True
+    ball_on = not bool(args.no_ball)
+    show_labels = False
     paused = source != "live"
     model: YOLO | None = None
+    ball_classes: list[int] | None = None
     ball_dets: tuple | None = None
+    ball_latch: dict = {"prev_z": None, "latch": None, "latch_until": 0.0}
     panel_split_x = 0
     frame_i = 0
     fps_ema = 0.0
@@ -915,11 +1160,11 @@ def main() -> int:
         elif source == "still":
             extra = f"Still pair: {src_l} | {src_r}\n"
         print(
-            f"Plane test defaults: H={h_angle:.1f}°  V={v_angle:.1f}°  "
-            f"behind={behind:.3f} m  extend={extend_up:.1f} m above bar  {rotate_label(rotate_deg)}\n"
+            f"Posts {baseline:.2f} m apart.  L/R = behind the goal, facing the field.\n"
             f"{extra}"
-            "Click far post(s) in each view. Use [ ] and - = to align the green grid "
-            "with the real posts.  O = cycle rotate 90/270/off\n"
+            "Blue = in field (whole ball between posts).  Green = through + between.  "
+            "Red = through but wide.  Need both cameras.\n"
+            "Click the visible FAR post then press K to lock the plane to it.\n"
         )
 
         xyz_l, xyz_r = cfg.camera_positions(baseline, behind)
@@ -978,14 +1223,6 @@ def main() -> int:
 
             # Rebuild projection if angles / size / rotate changed
             P1, P2 = build_projs()
-            fx_now, fy_now = cfg.focal_axes(img_w, img_h)
-            scale = (focal_px / fx_now) if fx_now > 1e-6 else 1.0
-            fx_use, fy_use = fx_now * scale, fy_now * scale
-            horiz = math.hypot(baseline, behind)
-            live_ray = v_angle - (cfg.VFOV_DEG / 2.0)
-            live_h = horiz * math.tan(math.radians(live_ray)) if live_ray > -89 else 0.0
-            live_slant = horiz / math.cos(math.radians(live_ray)) if abs(live_ray) < 89 else float("inf")
-            _, _, cfg_slant = cfg.lowest_visible_on_far_post(baseline, behind)
 
             now = time.time()
             dt = max(now - last_t, 1e-6)
@@ -995,70 +1232,60 @@ def main() -> int:
 
             disp_l = view_l.copy()
             disp_r = view_r.copy()
+            _, y_vis, _ = cfg.lowest_visible_on_far_post(baseline, behind, v_angle)
+            y_vis = max(0.0, float(y_vis))
             draw_goal_plane(
                 disp_l, P1, baseline, extend_up, pos_l, pos_r, "L",
-                show_point_labels=show_labels,
+                show_point_labels=show_labels, y_vis_min=y_vis,
             )
             draw_goal_plane(
                 disp_r, P2, baseline, extend_up, pos_l, pos_r, "R",
-                show_point_labels=show_labels,
+                show_point_labels=show_labels, y_vis_min=y_vis,
             )
             click_dbg = clicks.draw_on(disp_l, disp_r, P1, P2, pos_l, pos_r)
 
-            d_far_l = dist3(post_r, pos_l)
-            elev_far_l = elevation_from_horizontal(pos_l, post_r)
-            elev_far_r = elevation_from_horizontal(pos_r, post_l)
-
             ball_line = ""
+            ball_call = "none"
             if ball_on:
                 if model is None:
-                    print("Loading COCO yolov8n for ball...")
-                    model = YOLO(COCO_MODEL)
+                    model, ball_classes = load_ball_model(args.model or default_ball_model())
                 if ball_dets is None:
-                    ball_dets = detect_both(model, view_l, view_r, CONFIDENCE)
-                ball_line = paint_ball_pair(
+                    ball_dets = detect_both(
+                        model, view_l, view_r, args.conf, ball_classes,
+                    )
+                ball_line, ball_call = paint_ball_pair(
                     disp_l, disp_r, ball_dets[0], ball_dets[1],
-                    P1, P2, pos_l, pos_r, baseline,
+                    P1, P2, pos_l, pos_r, baseline, now, ball_latch,
                 )
 
-            cv2.putText(disp_l, "L", (8, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.9, COL_POST, 2, cv2.LINE_AA)
-            cv2.putText(disp_r, "R", (8, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.9, COL_CLICK_NEAR, 2, cv2.LINE_AA)
+            draw_camera_hud(disp_l, "L", rotate_deg)
+            draw_camera_hud(disp_r, "R", rotate_deg)
 
             combo, panel_split_x = side_by_side_full(disp_l, disp_r)
+            color, banner, pulse = call_style(ball_call)
+            if banner:
+                draw_flash_border(combo, color, now, pulse)
             pair_h = combo.shape[0]
 
             src_note = ""
             if source == "video" and cap_l is not None:
                 nxt = int(cap_l.get(cv2.CAP_PROP_POS_FRAMES) or 0)
                 shown = max(1, nxt)
-                src_note = f"  vid {shown}/{video_n} {'PAUSED' if paused else 'PLAY'}"
-            elif source == "still":
-                src_note = "  STILL"
-            src_note += f"  {rotate_label(rotate_deg)}"
-            help_line = (
-                "F/N mode | C clear | [ ] H | - = V | , . extend | D labels | "
-                "B ball | O rotate | S save | L load | R reset | Q quit"
-            )
-            if source == "video":
-                help_line = "SPACE pause | A/D seek | " + help_line
+                src_note = f"  {shown}/{video_n}"
             lines = [
-                f"LEFT {src_l} {img_w}x{img_h}  far {d_far_l:.2f}m elev {elev_far_l:.0f}deg   |   "
-                f"RIGHT {src_r} {img_w_r}x{img_h_r}  far {d_far_l:.2f}m elev {elev_far_r:.0f}deg",
-                f"H={h_angle:.1f}° V={v_angle:.1f}°  base={baseline:.2f}m  "
-                f"behind={behind:.2f}m  "
-                f"extend={extend_up:.1f}m  fx/fy={fx_use:.0f}/{fy_use:.0f}  "
-                f"FOV H/V={cfg.HFOV_DEG:.1f}/{cfg.VFOV_DEG:.1f}°  "
-                f"{fps_ema:.0f} fps  labels={'ON' if show_labels else 'OFF'}"
-                f"{src_note}",
-                f"Lowest ray={live_ray:.1f}°  far-post lowest Y={live_h:.2f}m  "
-                f"slant={live_slant:.2f}m  (expect ~{cfg_slant:.2f}m @ cfg)  "
-                f"mode={clicks.mode.upper()}",
-                help_line,
+                f"L {src_l}  R {src_r}  |  posts {baseline:.2f}m  "
+                f"ball Ø{cfg.BALL_DIAMETER_M*100:.0f}cm  "
+                f"H{h_angle:.0f} V{v_angle:.0f}  visY≥{y_vis:.2f}m  "
+                f"{fps_ema:.0f}fps  {rotate_label(rotate_deg)}{src_note}",
             ]
             if ball_line:
                 lines.append(ball_line)
-            lines.extend(click_dbg[:4])
-            packed, bar_h = attach_status_bar(combo, lines)
+            lines.extend(click_dbg[:1])
+            packed, bar_h = attach_status_bar(
+                combo, lines,
+                accent_color=color if banner else None,
+                accent_line=ball_line,
+            )
 
             win = window_client_size() or (1600, 900)
             canvas, x0, y0, nw, nh = letterbox(packed, win[0], win[1])
@@ -1141,6 +1368,20 @@ def main() -> int:
             elif key == ord("."):
                 extend_up = min(20.0, extend_up + 0.5)
                 print(f"  extend_up → {extend_up:.1f} m")
+            elif key in (ord("k"), ord("K")):
+                if not clicks.far_l and not clicks.far_r:
+                    print("  K: click the FAR post in one or both views first (F mode)")
+                else:
+                    new_h, err = lock_h_to_far_clicks(
+                        clicks, pos_l, pos_r, h_angle, v_angle,
+                        focal_px, focal_r, img_w, img_h, img_w_r, img_h_r,
+                        baseline, y_vis, extend_up,
+                    )
+                    h_angle = new_h
+                    print(
+                        f"  Locked H → {h_angle:.1f}°  "
+                        f"(far-post click err {err:.0f}px). R resets."
+                    )
             elif key in (ord("r"), ord("R")):
                 h_angle = float(cfg.H_ANGLE_DEG)
                 v_angle = float(cfg.V_ANGLE_DEG)
@@ -1148,6 +1389,8 @@ def main() -> int:
             elif key in (ord("b"), ord("B")):
                 ball_on = not ball_on
                 ball_dets = None
+                ball_latch["prev_z"] = None
+                ball_latch["latch"] = None
                 print(f"  Ball detection {'ON' if ball_on else 'OFF'}")
             elif key in (ord("d"), ord("D")):
                 show_labels = not show_labels

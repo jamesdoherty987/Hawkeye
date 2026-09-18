@@ -59,11 +59,9 @@ WINDOW = "Hawkeye Stereo Calibrate — C calibrate | Q quit"
 
 SMOOTH_N = 6             # median smoothing window for 3D position
 
-# Football diameter — used ONLY during C-key calibration. Cameras look up at the
-# ball, so left sees the SW (bottom-left) face and right the SE (bottom-right);
-# we nudge YOLO centres from those faces toward the true ball centre.
-BALL_DIAMETER_M = 0.22
-BALL_RADIUS_M = BALL_DIAMETER_M / 2.0
+# Football diameter — bbox centre is the near face, not the 3D centre.
+BALL_DIAMETER_M = cfg.BALL_DIAMETER_M
+BALL_RADIUS_M = cfg.BALL_RADIUS_M
 
 
 # ─── Camera helpers ──────────────────────────────────────────────────────────

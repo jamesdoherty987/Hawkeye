@@ -19,16 +19,16 @@ Rig geometry
   (not in the plane of the wood). They aim across the goal toward the
   far post, tilted upward. Baseline is lens-to-lens along the bar.
 
-    Baseline : 128 cm
+    Baseline : 100 cm
     Behind   : ~10 cm  (lens centre behind the field-side face of the post)
     H-angle  : ~90°    (across the goal toward the far post)
     V-angle  : ~55°    (up from horizontal)
 
   With V_ANGLE=55° and image VFOV=70°, half-FOV=35° → lowest ray ≈ 20°
   above horizontal. Lowest visible point on the far post (horiz. dist ≈
-  hypot(baseline, behind)):
-    height  ≈ 0.47 m above the bar
-    slant   ≈ 1.36 m  (ray length, not height)
+  hypot(baseline, behind) ≈ 1.00 m):
+    height  ≈ 0.37 m above the bar  (the bar itself is below the FOV)
+    slant   ≈ 1.07 m  (ray length, not height)
 
 World frame
 ───────────
@@ -49,12 +49,14 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 # ── Physical rig ─────────────────────────────────────────────────────────────
 
-BASELINE_M: float = 1.28       # centre-to-centre camera separation (metres)
+BASELINE_M: float = 1.00       # centre-to-centre camera separation (metres)
 # Lens centre behind the field-side face of the post (metres). Cameras clamp
 # at the post–crossbar corner, on the back of the wood. Goal plane stays Z=0.
 CAM_BEHIND_POST_M: float = 0.10
 H_ANGLE_DEG: float = 90.0      # aim across goal toward far post (0° = into field)
 V_ANGLE_DEG: float = 55.0      # tilt upward from horizontal (degrees)
+BALL_DIAMETER_M: float = 0.22  # football; bbox centre is not the 3D centre
+BALL_RADIUS_M: float = BALL_DIAMETER_M / 2.0
 
 # ── Datasheet (sensor upright, before sideways mount) ────────────────────────
 
@@ -113,17 +115,21 @@ def camera_positions(
 def lowest_visible_on_far_post(
     baseline_m: float = BASELINE_M,
     behind_m: float | None = None,
+    v_angle_deg: float | None = None,
 ) -> tuple[float, float, float]:
     """
     Horizontal range to the far post is hypot(baseline, behind).
     Returns (lowest_ray_deg, height_on_post_m, slant_range_m).
+    The crossbar (Y=0) is below this height when V_ANGLE − VFOV/2 > 0.
     """
     d = CAM_BEHIND_POST_M if behind_m is None else behind_m
+    v = V_ANGLE_DEG if v_angle_deg is None else v_angle_deg
+    ray = v - (VFOV_DEG / 2.0)
     horiz = math.hypot(baseline_m, d)
-    alpha = math.radians(LOWEST_RAY_DEG)
+    alpha = math.radians(ray)
     height = horiz * math.tan(alpha)
-    slant = horiz / math.cos(alpha)
-    return LOWEST_RAY_DEG, height, slant
+    slant = horiz / math.cos(alpha) if abs(ray) < 89 else float("inf")
+    return ray, height, slant
 
 
 def focal_axes(image_width: int, image_height: int) -> tuple[float, float]:
