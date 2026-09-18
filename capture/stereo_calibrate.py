@@ -1,57 +1,40 @@
 """
-stereo_calibrate.py — Converging stereo calibration and real-time 3D ball position.
+stereo_calibrate.py — Converging stereo live 3D ball position.
 
-For cameras mounted on goalposts that point INWARD toward each other and tilted UPWARD.
-This replaces the simple parallel-stereo test for the converging camera setup.
+Cameras clamp to the post–crossbar corners (behind the wood), aimed across
+the goal and tilted up. Rig numbers live in stereo_config.py.
 
 How it works
 ────────────
-  Uses full 3D triangulation (OpenCV triangulatePoints) with known camera geometry:
-    - Baseline : physical distance between cameras  (tape measure, e.g. 6.5 m)
-    - H-angle  : how far each camera is rotated inward from straight-ahead (degrees)
-    - V-angle  : how far each camera is tilted upward (degrees)
-    - Focal    : lens focal length in pixels (loaded from old calib or estimated from FOV)
+  OpenCV triangulatePoints with known geometry:
+    - Baseline : lens-to-lens along the bar
+    - Behind   : lens behind the field-side post face (goal plane stays Z=0)
+    - H-angle  : yaw toward the far post (0° = into field, 90° = along the bar)
+    - V-angle  : tilt up from horizontal
+    - Focal    : from mounted HFOV × frame width in stereo_config (not a JSON file)
 
-  The 3D world origin is the midpoint between the two cameras.
-    X → positive toward the RIGHT camera (between posts: X in [-baseline/2, +baseline/2])
-    Y → positive UPWARD
-    Z → positive INTO THE FIELD (away from the goal)
+  World origin is the midpoint of the crossbar on the goal plane.
+    X → toward the RIGHT post  (between posts: X in [-baseline/2, +baseline/2])
+    Y → UP
+    Z → INTO THE FIELD  (posts at Z=0; cameras at Z=−behind)
 
-Output shown in real time:
-  Ball X  : lateral position relative to midpoint (0 = dead centre)
-  Ball Y  : height above cameras
-  Ball Z  : depth into field from goal line
-  Verdict : BETWEEN POSTS / OUTSIDE LEFT / OUTSIDE RIGHT
-
-Calibration (C key)
-────────────────────
-  Focal length is a LENS property — it doesn't change with angle or baseline.
-  Your old focal (438 px at 480 px wide) scales automatically for resolution changes.
-  You do NOT need to know the ball's size to calibrate.
-
-  To calibrate or verify focal_px:
-    1. Hold the ball at the MIDPOINT between the two cameras (equidistant from both).
-    2. Measure how far it is above the camera bar with a tape measure.
-       Pass that as --known-height (e.g. --known-height 1.5).
-    3. Both cameras must see the ball. Press C.
-       The script triangulates the ball's Y position and adjusts focal_px
-       until the computed height matches your measurement. No ball size needed.
-
-Saves to: exports/stereo/calib.json
+C key (optional session check)
+──────────────────────────────
+  Hold the ball at the midpoint, measure height of the ball centre above the bar,
+  pass --known-height, press C. Scales this session's focal so triangulated Y
+  matches that height. Does not write files — persist a change in stereo_config.py.
 
 Usage
 ─────
-  python capture/stereo_calibrate.py --left 0 --right 1 --baseline 6.5
-  python capture/stereo_calibrate.py --left 0 --right 1 --baseline 6.5 \\
-      --h-angle 45 --v-angle 45 --known-distance 5.0
+  python capture/stereo_calibrate.py --left 0 --right 1
+  python capture/stereo_calibrate.py --left 0 --right 1 --known-height 0.60
 
-Keys: C = calibrate focal length | Q = quit and save current params
+Keys: C = check / scale focal this session | Q = quit
 """
 
 from __future__ import annotations
 
 import argparse
-import json
 import math
 import platform
 import sys
@@ -72,7 +55,7 @@ COCO_MODEL = "yolov8n.pt"
 SPORTS_BALL_CLASS = 32
 IMAGE_SIZE = 640
 CONFIDENCE = 0.30
-WINDOW = "Hawkeye Stereo Calibrate — C calibrate | Q save & quit"
+WINDOW = "Hawkeye Stereo Calibrate — C calibrate | Q quit"
 
 SMOOTH_N = 6             # median smoothing window for 3D position
 
@@ -139,10 +122,10 @@ def make_proj_matrix(
     positioned at cam_pos_world and pointing inward/upward.
 
     World frame:
-      Origin = midpoint between cameras
-      X = positive toward right camera
+      Origin = midpoint of the crossbar on the goal plane
+      X = positive toward right post
       Y = positive upward
-      Z = positive into the field
+      Z = positive into the field (posts at Z=0; cameras at Z=−behind)
 
     Camera convention (OpenCV):
       Camera X = right in image
@@ -303,31 +286,9 @@ def between_posts_verdict(x: float, baseline: float, margin: float = 0.10) -> st
 # ─── Focal length management — delegates to stereo_config ─────────────────────
 
 def load_focal(img_w: int) -> tuple[float, str]:
-    """Thin wrapper; priority: calib.json → simple_focal.json → spec formula."""
+    """Focal from stereo_config (mounted HFOV × width)."""
     f, src = cfg.get_focal_px(img_w)
-    if "spec-derived" in src:
-        src += "  (press C to calibrate)"
-    return f, src
-
-
-def save_calib(
-    focal_px: float,
-    baseline: float,
-    h_angle: float,
-    v_angle: float,
-    img_w: int,
-    img_h: int,
-    known_dist: float | None = None,
-) -> None:
-    cfg.save_calib(
-        focal_px=focal_px,
-        baseline_m=baseline,
-        h_angle_deg=h_angle,
-        v_angle_deg=v_angle,
-        image_width=img_w,
-        image_height=img_h,
-        calibrated_at_height_m=known_dist,
-    )
+    return f, src + "  (press C to check this session)"
 
 
 # ─── Ball detection (COCO or custom model) ───────────────────────────────────
@@ -415,6 +376,11 @@ def main() -> int:
              f"Default {cfg.BASELINE_M}",
     )
     parser.add_argument(
+        "--behind", type=float, default=cfg.CAM_BEHIND_POST_M,
+        help="Lens centre behind the field-side post face in metres. "
+             f"Default {cfg.CAM_BEHIND_POST_M}",
+    )
+    parser.add_argument(
         "--h-angle", type=float, default=cfg.H_ANGLE_DEG,
         help=f"Horizontal inward angle each camera makes with the bar (degrees). "
              f"Default {cfg.H_ANGLE_DEG}",
@@ -458,8 +424,11 @@ def main() -> int:
     if args.baseline <= 0:
         print("ERROR: --baseline must be > 0", file=sys.stderr)
         return 1
-    if not (0 < args.h_angle < 90):
-        print("ERROR: --h-angle must be in (0, 90)", file=sys.stderr)
+    if args.behind < 0:
+        print("ERROR: --behind must be >= 0", file=sys.stderr)
+        return 1
+    if not (0 < args.h_angle <= 90):
+        print("ERROR: --h-angle must be in (0, 90]", file=sys.stderr)
         return 1
     if not (0 <= args.v_angle < 90):
         print("ERROR: --v-angle must be in [0, 90)", file=sys.stderr)
@@ -503,6 +472,7 @@ def main() -> int:
         print(
             f"\nSetup:"
             f"\n  Baseline  : {args.baseline:.3f} m"
+            f"\n  Behind    : {args.behind:.3f} m  (lens behind post; plane Z=0)"
             f"\n  H-angle   : {args.h_angle:.1f}°  (each camera rotated inward)"
             f"\n  V-angle   : {args.v_angle:.1f}°  (each camera tilted upward)"
             f"\n  Focal     : {focal_px:.1f} px  ({focal_src})"
@@ -515,12 +485,12 @@ def main() -> int:
             "    Cams look up → left sees SW (bottom-left) face, right sees SE (bottom-right).\n"
             f"    Uses {BALL_DIAMETER_M*100:.0f} cm diameter to correct that viewpoint bias.\n"
             f"    Current known-height = {args.known_height:.2f} m  (set with --known-height)"
-            "\nQ = save & quit\n"
+            "\nQ = quit\n"
         )
 
-        # Camera positions in world (origin = midpoint, X right, Y up, Z into field)
-        pos_l = np.array([-args.baseline / 2, 0.0, 0.0])
-        pos_r = np.array([ args.baseline / 2, 0.0, 0.0])
+        xyz_l, xyz_r = cfg.camera_positions(args.baseline, args.behind)
+        pos_l = np.array(xyz_l)
+        pos_r = np.array(xyz_r)
 
         # Build projection matrices — rebuilt each time focal_px changes
         def build_projs():
@@ -579,8 +549,11 @@ def main() -> int:
 
             key = cv2.waitKey(1) & 0xFF
             if key in (ord("q"), ord("Q")):
-                save_calib(focal_px, args.baseline, args.h_angle, args.v_angle,
-                           img_w, img_h)
+                print(
+                    f"Quit. Session focal={focal_px:.1f} px  "
+                    f"H={args.h_angle:.1f}° V={args.v_angle:.1f}°  "
+                    f"baseline={args.baseline:.3f} m  behind={args.behind:.3f} m"
+                )
                 break
 
             if key in (ord("c"), ord("C")):
@@ -636,14 +609,13 @@ def main() -> int:
                 focal_px = new_focal
                 P1, P2 = build_projs()
                 positions_3d.clear()
-                save_calib(focal_px, args.baseline, args.h_angle, args.v_angle,
-                           img_w, img_h, known_dist=known_h)
                 print(
-                    f"Calibrated: computed_Y={computed_y:.3f} m → known={known_h:.3f} m "
+                    f"Session focal: computed_Y={computed_y:.3f} m → known={known_h:.3f} m "
                     f"(scale={scale:.3f}) → focal_px={focal_px:.1f}\n"
+                    f"  Not written to disk — edit stereo_config.py to persist.\n"
                     f"  SW/SE underside correction ({BALL_DIAMETER_M*100:.0f} cm ball): {corr_summary}\n"
                     f"  bbox diam L={diam_l:.0f}px R={diam_r:.0f}px\n"
-                    f"  Ball 3D position at calibration: "
+                    f"  Ball 3D position: "
                     f"X={trial_pos[0]*scale:.3f} m  Y={known_h:.3f} m  Z={trial_pos[2]*scale:.3f} m"
                 )
 

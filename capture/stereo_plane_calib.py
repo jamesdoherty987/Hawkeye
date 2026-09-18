@@ -7,10 +7,11 @@ into both camera views with your current stereo_config angles.
 
 Assumptions
 ───────────
-  Cameras sit at the post–crossbar corners.
-  Goal plane = plane containing both cameras and world-up  (Z = 0).
+  Cameras clamp at the post–crossbar corners, on the BACK of the posts.
+  Goal plane = posts + crossbar (Z = 0), extended UP for high balls.
   Left post  at X = −baseline/2,  right post at X = +baseline/2.
-  Crossbar height ≈ camera height (Y = 0). Plane extends UP for high balls.
+  Cameras share that X/Y but sit CAM_BEHIND_POST_M behind the wood (Z < 0).
+  Crossbar height ≈ camera height (Y = 0).
 
   Config aim (edit stereo_config.py):
     H_ANGLE ≈ 90°  → each camera looks across the goal toward the far post
@@ -653,6 +654,7 @@ def paint_ball_pair(
 
 def save_plane(
     baseline_m: float,
+    behind_m: float,
     h_angle: float,
     v_angle: float,
     extend_up_m: float,
@@ -665,6 +667,7 @@ def save_plane(
     PLANE_PATH.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "baseline_m": baseline_m,
+        "cam_behind_post_m": behind_m,
         "h_angle_deg": h_angle,
         "v_angle_deg": v_angle,
         "extend_up_m": extend_up_m,
@@ -674,12 +677,13 @@ def save_plane(
         "cameras_sideways": cfg.CAMERAS_SIDEWAYS,
         "rotate_deg": rotate_deg,
         "plane": {
-            "origin": "midpoint between cameras",
+            "origin": "midpoint of crossbar on the goal plane",
             "equation": "Z = 0 (goal plane / posts / crossbar)",
+            "cameras_z": -behind_m,
             "left_post_x": -baseline_m / 2.0,
             "right_post_x": baseline_m / 2.0,
             "crossbar_y": 0.0,
-            "note": "Y > 0 is above the bar; Z > 0 is into the field",
+            "note": "Y > 0 is above the bar; Z > 0 is into the field; cameras at Z = −behind",
         },
         "clicks": clicks.to_dict(),
         "camera": "B0332 + LN013 NOIR",
@@ -731,6 +735,10 @@ def main() -> int:
         help="Right-camera still (jpg/png/…). Use with --image-left",
     )
     parser.add_argument("--baseline", type=float, default=cfg.BASELINE_M)
+    parser.add_argument(
+        "--behind", type=float, default=cfg.CAM_BEHIND_POST_M,
+        help="Lens centre behind the field-side post face (metres)",
+    )
     parser.add_argument("--h-angle", type=float, default=cfg.H_ANGLE_DEG)
     parser.add_argument("--v-angle", type=float, default=cfg.V_ANGLE_DEG)
     parser.add_argument("--extend", type=float, default=4.0,
@@ -777,6 +785,13 @@ def main() -> int:
     v_angle = float(args.v_angle)
     extend_up = float(args.extend)
     baseline = float(args.baseline)
+    behind = float(args.behind)
+    if baseline <= 0:
+        print("ERROR: --baseline must be > 0", file=sys.stderr)
+        return 1
+    if behind < 0:
+        print("ERROR: --behind must be >= 0", file=sys.stderr)
+        return 1
     rotate_deg = int(args.rotate) if args.rotate is not None else int(cfg.SIDEWAYS_ROTATE_DEG)
     if rotate_deg not in (0, 90, 270):
         rotate_deg = 90
@@ -890,7 +905,7 @@ def main() -> int:
             focal_px, focal_src = cfg.get_focal_px(img_w)
             focal_r, _ = cfg.get_focal_px(img_w_r)
 
-        cfg.print_summary(focal_px, focal_src)
+        cfg.print_summary(focal_px, focal_src, behind_m=behind)
         extra = ""
         if source == "video":
             extra = (
@@ -901,14 +916,17 @@ def main() -> int:
             extra = f"Still pair: {src_l} | {src_r}\n"
         print(
             f"Plane test defaults: H={h_angle:.1f}°  V={v_angle:.1f}°  "
-            f"extend={extend_up:.1f} m above bar  {rotate_label(rotate_deg)}\n"
+            f"behind={behind:.3f} m  extend={extend_up:.1f} m above bar  {rotate_label(rotate_deg)}\n"
             f"{extra}"
             "Click far post(s) in each view. Use [ ] and - = to align the green grid "
             "with the real posts.  O = cycle rotate 90/270/off\n"
         )
 
-        pos_l = np.array([-baseline / 2.0, 0.0, 0.0])
-        pos_r = np.array([baseline / 2.0, 0.0, 0.0])
+        xyz_l, xyz_r = cfg.camera_positions(baseline, behind)
+        pos_l = np.array(xyz_l)
+        pos_r = np.array(xyz_r)
+        post_l = np.array([-baseline / 2.0, 0.0, 0.0])
+        post_r = np.array([baseline / 2.0, 0.0, 0.0])
 
         def build_projs():
             # Left looks across toward +X (far/right post); right toward −X
@@ -963,11 +981,11 @@ def main() -> int:
             fx_now, fy_now = cfg.focal_axes(img_w, img_h)
             scale = (focal_px / fx_now) if fx_now > 1e-6 else 1.0
             fx_use, fy_use = fx_now * scale, fy_now * scale
-            _, _, slant = cfg.lowest_visible_on_far_post(baseline)
-            # Recompute lowest ray from live V angle (config helper uses config V)
+            horiz = math.hypot(baseline, behind)
             live_ray = v_angle - (cfg.VFOV_DEG / 2.0)
-            live_h = baseline * math.tan(math.radians(live_ray)) if live_ray > -89 else 0.0
-            live_slant = baseline / math.cos(math.radians(live_ray)) if abs(live_ray) < 89 else float("inf")
+            live_h = horiz * math.tan(math.radians(live_ray)) if live_ray > -89 else 0.0
+            live_slant = horiz / math.cos(math.radians(live_ray)) if abs(live_ray) < 89 else float("inf")
+            _, _, cfg_slant = cfg.lowest_visible_on_far_post(baseline, behind)
 
             now = time.time()
             dt = max(now - last_t, 1e-6)
@@ -987,9 +1005,9 @@ def main() -> int:
             )
             click_dbg = clicks.draw_on(disp_l, disp_r, P1, P2, pos_l, pos_r)
 
-            d_far_l = dist3(pos_r, pos_l)
-            elev_far_l = elevation_from_horizontal(pos_l, pos_r)
-            elev_far_r = elevation_from_horizontal(pos_r, pos_l)
+            d_far_l = dist3(post_r, pos_l)
+            elev_far_l = elevation_from_horizontal(pos_l, post_r)
+            elev_far_r = elevation_from_horizontal(pos_r, post_l)
 
             ball_line = ""
             if ball_on:
@@ -1027,12 +1045,13 @@ def main() -> int:
                 f"LEFT {src_l} {img_w}x{img_h}  far {d_far_l:.2f}m elev {elev_far_l:.0f}deg   |   "
                 f"RIGHT {src_r} {img_w_r}x{img_h_r}  far {d_far_l:.2f}m elev {elev_far_r:.0f}deg",
                 f"H={h_angle:.1f}° V={v_angle:.1f}°  base={baseline:.2f}m  "
+                f"behind={behind:.2f}m  "
                 f"extend={extend_up:.1f}m  fx/fy={fx_use:.0f}/{fy_use:.0f}  "
                 f"FOV H/V={cfg.HFOV_DEG:.1f}/{cfg.VFOV_DEG:.1f}°  "
                 f"{fps_ema:.0f} fps  labels={'ON' if show_labels else 'OFF'}"
                 f"{src_note}",
                 f"Lowest ray={live_ray:.1f}°  far-post lowest Y={live_h:.2f}m  "
-                f"slant={live_slant:.2f}m  (expect ~{slant:.2f}m @ cfg)  "
+                f"slant={live_slant:.2f}m  (expect ~{cfg_slant:.2f}m @ cfg)  "
                 f"mode={clicks.mode.upper()}",
                 help_line,
             ]
@@ -1140,7 +1159,7 @@ def main() -> int:
                 print(f"  {rotate_label(rotate_deg)}  (clicks cleared)")
             elif key in (ord("s"), ord("S")):
                 save_plane(
-                    baseline, h_angle, v_angle, extend_up,
+                    baseline, behind, h_angle, v_angle, extend_up,
                     focal_px, img_w, img_h, clicks, rotate_deg,
                 )
             elif key in (ord("l"), ord("L")):
@@ -1151,6 +1170,10 @@ def main() -> int:
                     h_angle = float(data.get("h_angle_deg", h_angle))
                     v_angle = float(data.get("v_angle_deg", v_angle))
                     extend_up = float(data.get("extend_up_m", extend_up))
+                    behind = float(data.get("cam_behind_post_m", behind))
+                    xyz_l, xyz_r = cfg.camera_positions(baseline, behind)
+                    pos_l = np.array(xyz_l)
+                    pos_r = np.array(xyz_r)
                     rd = int(data.get("rotate_deg", rotate_deg))
                     if rd in (0, 90, 270) and rd != rotate_deg:
                         rotate_deg = rd
@@ -1158,7 +1181,7 @@ def main() -> int:
                     clicks.load_dict(data.get("clicks", {}))
                     print(
                         f"  Loaded {PLANE_PATH}  H={h_angle:.1f} V={v_angle:.1f}  "
-                        f"{rotate_label(rotate_deg)}"
+                        f"behind={behind:.3f} m  {rotate_label(rotate_deg)}"
                     )
 
     except RuntimeError as e:
