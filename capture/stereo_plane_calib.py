@@ -21,8 +21,9 @@ Controls
   Click LEFT panel  = mark a point on the LEFT camera image
   Click RIGHT panel = mark a point on the RIGHT camera image
 
-  F = next clicks are FAR post (default)
-  K = lock the plane H-angle to those far-post clicks
+  F = next clicks are FAR post (default). Click BOTTOM of the post, then TOP.
+      The whole overlay (yellow posts + orange crossbar) slides with the yellow line.
+  K = re-snap if you moved the clicks
   N = next clicks are NEAR post
   C = clear all click marks
 
@@ -143,12 +144,13 @@ def label_world_point(
     pos_r: np.ndarray,
     name: str,
     which_cam: str,
+    affine: np.ndarray | None = None,
 ) -> None:
     """
     Project a world point and annotate distance to BOTH cameras plus elevation
     from *this* camera (the feed we're drawing on).
     """
-    uv = project_safe(P, xyz)
+    uv = project_safe(P, xyz, affine)
     if uv is None:
         return
     u, v = uv
@@ -338,7 +340,24 @@ def goal_corners(
     }
 
 
-def project_safe(P: np.ndarray, xyz: np.ndarray) -> tuple[int, int] | None:
+def apply_affine(
+    uv: tuple[float, float],
+    affine: np.ndarray | None,
+) -> tuple[float, float]:
+    if affine is None:
+        return uv
+    x, y = uv
+    return (
+        float(affine[0, 0] * x + affine[0, 1] * y + affine[0, 2]),
+        float(affine[1, 0] * x + affine[1, 1] * y + affine[1, 2]),
+    )
+
+
+def project_safe(
+    P: np.ndarray,
+    xyz: np.ndarray,
+    affine: np.ndarray | None = None,
+) -> tuple[int, int] | None:
     uv = project_world(P, xyz)
     if uv is None:
         return None
@@ -348,6 +367,9 @@ def project_safe(P: np.ndarray, xyz: np.ndarray) -> tuple[int, int] | None:
     # Reject points behind the camera (negative depth in camera frame ≈ hom[2] sign
     # already handled in project_world via division; still clamp absurd values)
     if abs(u) > 1e5 or abs(v) > 1e5:
+        return None
+    u, v = apply_affine((u, v), affine)
+    if not (math.isfinite(u) and math.isfinite(v)) or abs(u) > 1e5 or abs(v) > 1e5:
         return None
     return int(round(u)), int(round(v))
 
@@ -360,13 +382,14 @@ def draw_line_world(
     color: tuple[int, int, int],
     thickness: int = 2,
     n_seg: int = 24,
+    affine: np.ndarray | None = None,
 ) -> None:
     """Draw a 3D segment by sampling so perspective looks correct."""
     pts: list[tuple[int, int]] = []
     for i in range(n_seg + 1):
         t = i / n_seg
         xyz = a * (1.0 - t) + b * t
-        uv = project_safe(P, xyz)
+        uv = project_safe(P, xyz, affine)
         if uv is not None:
             pts.append(uv)
     for i in range(len(pts) - 1):
@@ -385,45 +408,60 @@ def draw_goal_plane(
     grid_ny: int = 8,
     show_point_labels: bool = True,
     y_vis_min: float = 0.0,
+    affine: np.ndarray | None = None,
 ) -> None:
-    """Draw the visible part of the goal plane. The bar is often below the FOV."""
+    """Draw posts, orange crossbar at Y=0, and grid. Optional 2D snap affine."""
     half = baseline_m / 2.0
-    y0 = max(0.0, float(y_vis_min))
-    y1 = max(y0 + 0.2, float(extend_up_m))
+    y1 = max(0.4, float(extend_up_m))
 
-    # Visible uprights (from lowest ray up — not from the unseen bar)
-    draw_line_world(img, P, np.array([-half, y0, 0.0]), np.array([-half, y1, 0.0]), COL_POST, 3)
-    draw_line_world(img, P, np.array([half, y0, 0.0]), np.array([half, y1, 0.0]), COL_POST, 3)
-    draw_line_world(img, P, np.array([-half, y0, 0.0]), np.array([half, y0, 0.0]), COL_BAR, 2)
-    draw_line_world(img, P, np.array([-half, y1, 0.0]), np.array([half, y1, 0.0]), COL_GRID, 1)
+    # Orange = real crossbar (Y = 0). Yellow posts run from the bar upward.
+    draw_line_world(
+        img, P, np.array([-half, 0.0, 0.0]), np.array([half, 0.0, 0.0]),
+        COL_BAR, 3, affine=affine,
+    )
+    draw_line_world(
+        img, P, np.array([-half, 0.0, 0.0]), np.array([-half, y1, 0.0]),
+        COL_POST, 3, affine=affine,
+    )
+    draw_line_world(
+        img, P, np.array([half, 0.0, 0.0]), np.array([half, y1, 0.0]),
+        COL_POST, 3, affine=affine,
+    )
+    draw_line_world(
+        img, P, np.array([-half, y1, 0.0]), np.array([half, y1, 0.0]),
+        COL_GRID, 1, affine=affine,
+    )
 
     for i in range(grid_nx + 1):
         x = -half + (baseline_m * i / grid_nx)
-        a = np.array([x, y0, 0.0])
+        a = np.array([x, 0.0, 0.0])
         b = np.array([x, y1, 0.0])
-        draw_line_world(img, P, a, b, COL_GRID, 1, n_seg=16)
+        draw_line_world(img, P, a, b, COL_GRID, 1, n_seg=16, affine=affine)
 
     for j in range(1, grid_ny + 1):
-        y = y0 + (y1 - y0) * j / grid_ny
+        y = y1 * j / grid_ny
         a = np.array([-half, y, 0.0])
         b = np.array([half, y, 0.0])
-        draw_line_world(img, P, a, b, COL_GRID, 1, n_seg=16)
+        draw_line_world(img, P, a, b, COL_GRID, 1, n_seg=16, affine=affine)
 
-    uv = project_safe(P, np.array([0.0, y0, 0.0]))
-    if uv is not None:
-        put_label(img, f"FOV from {y0:.2f}m above bar", (uv[0] + 6, uv[1] + 16), COL_DEBUG, 0.4, 1)
+    y_note = max(0.0, float(y_vis_min))
+    uv = project_safe(P, np.array([0.0, y_note, 0.0]), affine)
+    if uv is not None and y_note > 0.05:
+        put_label(img, f"FOV from {y_note:.2f}m above bar", (uv[0] + 6, uv[1] + 16), COL_DEBUG, 0.4, 1)
 
     if not show_point_labels:
         return
 
     far_name = "R" if which_cam == "L" else "L"
+    far_x = half if far_name == "R" else -half
     landmarks: list[tuple[str, np.ndarray]] = [
-        (f"{far_name}@{y0:.2f}m", np.array([half if far_name == "R" else -half, y0, 0.0])),
-        (f"{far_name}-mid", np.array([half if far_name == "R" else -half, (y0 + y1) * 0.5, 0.0])),
-        (f"{far_name}-top", np.array([half if far_name == "R" else -half, y1, 0.0])),
+        ("bar", np.array([0.0, 0.0, 0.0])),
+        (f"{far_name}-bar", np.array([far_x, 0.0, 0.0])),
+        (f"{far_name}-mid", np.array([far_x, y1 * 0.5, 0.0])),
+        (f"{far_name}-top", np.array([far_x, y1, 0.0])),
     ]
     for name, xyz in landmarks:
-        label_world_point(img, P, xyz, pos_l, pos_r, name, which_cam)
+        label_world_point(img, P, xyz, pos_l, pos_r, name, which_cam, affine)
 
 
 def fit_height(img: np.ndarray, target_h: int) -> np.ndarray:
@@ -502,7 +540,7 @@ class ClickState:
         self.near_l: list[tuple[int, int]] = []
         self.near_r: list[tuple[int, int]] = []
 
-    def add(self, side: str, xy: tuple[int, int]) -> None:
+    def add(self, side: str, xy: tuple[int, int]) -> int:
         bucket = {
             ("far", "L"): self.far_l,
             ("far", "R"): self.far_r,
@@ -510,7 +548,15 @@ class ClickState:
             ("near", "R"): self.near_r,
         }[(self.mode, side)]
         bucket.append(xy)
-        print(f"  Marked {self.mode.upper()} post on {side}: {xy}  (n={len(bucket)})")
+        if self.mode == "far" and len(bucket) > 2:
+            del bucket[:-2]
+        if self.mode == "far":
+            tag = "BOTTOM of post" if len(bucket) == 1 else "TOP of post"
+            extra = "  → now click the TOP of the same post" if len(bucket) == 1 else "  → snapping yellow post"
+            print(f"  {side} {tag}: {xy}{extra}")
+        else:
+            print(f"  Marked {self.mode.upper()} post on {side}: {xy}  (n={len(bucket)})")
+        return len(bucket)
 
     def clear(self) -> None:
         self.far_l.clear()
@@ -531,18 +577,21 @@ class ClickState:
         """Draw clicks; if paired L/R exist, triangulate and annotate distances."""
         debug_lines: list[str] = []
 
-        def _draw(img, pts, color, label):
+        def _draw(img, pts, color, far: bool):
+            names = ("BOT", "TOP") if far else ("N1", "N2")
             for i, (x, y) in enumerate(pts):
                 cv2.circle(img, (x, y), 7, color, -1, cv2.LINE_AA)
-                put_label(img, f"{label}{i+1}", (x + 8, y - 8), color, 0.5, 1)
+                put_label(img, names[i] if i < 2 else f"{i+1}", (x + 8, y - 8), color, 0.5, 1)
             if len(pts) >= 2:
-                for i in range(len(pts) - 1):
-                    cv2.line(img, pts[i], pts[i + 1], color, 2, cv2.LINE_AA)
+                cv2.line(img, pts[0], pts[1], color, 2, cv2.LINE_AA)
+                cv2.arrowedLine(
+                    img, pts[0], pts[1], color, 2, cv2.LINE_AA, tipLength=0.12,
+                )
 
-        _draw(img_l, self.far_l, COL_CLICK_FAR, "F")
-        _draw(img_r, self.far_r, COL_CLICK_FAR, "F")
-        _draw(img_l, self.near_l, COL_CLICK_NEAR, "N")
-        _draw(img_r, self.near_r, COL_CLICK_NEAR, "N")
+        _draw(img_l, self.far_l, COL_CLICK_FAR, True)
+        _draw(img_r, self.far_r, COL_CLICK_FAR, True)
+        _draw(img_l, self.near_l, COL_CLICK_NEAR, False)
+        _draw(img_r, self.near_r, COL_CLICK_NEAR, False)
 
         if P1 is None or P2 is None or pos_l is None or pos_r is None:
             return debug_lines
@@ -639,75 +688,72 @@ def plane_side_label(z: float, eps: float = PLANE_CROSS_M) -> str:
     return "on-plane"
 
 
-def point_to_post_px(
+def overlay_snap_to_clicks(
     P: np.ndarray,
-    click: tuple[int, int],
+    pts: list[tuple[int, int]],
     post_x: float,
     y0: float,
     y1: float,
-    n: int = 32,
-) -> float:
-    """Pixel distance from a click to the projected far-post line."""
-    best = 1e9
-    cx, cy = float(click[0]), float(click[1])
-    for i in range(n + 1):
-        y = y0 + (y1 - y0) * i / n
-        uv = project_safe(P, np.array([post_x, y, 0.0]))
-        if uv is None:
+) -> tuple[np.ndarray | None, float, str]:
+    """
+    Keep the default 3D plane. Slide/rotate the whole overlay in the image
+    so the yellow far post lies on BOT→TOP. Orange bar and grid move with it.
+    Returns (2x3 affine, mean pixel shift, note).
+    """
+    if len(pts) < 2:
+        return None, -1.0, "need BOTTOM then TOP"
+    bot = np.array(pts[0], dtype=np.float64)
+    top = np.array(pts[1], dtype=np.float64)
+    dst = top - bot
+    if float(np.linalg.norm(dst)) < 4.0:
+        return None, -1.0, "BOT and TOP are too close"
+
+    uv_hi = project_world(P, np.array([post_x, y1, 0.0], dtype=np.float64))
+    uv_lo = None
+    for y in (y0, y0 + 0.25 * (y1 - y0), 0.5 * (y0 + y1)):
+        cand = project_world(P, np.array([post_x, y, 0.0], dtype=np.float64))
+        if cand is None:
             continue
-        best = min(best, math.hypot(uv[0] - cx, uv[1] - cy))
-    return best
+        if not all(math.isfinite(v) for v in cand):
+            continue
+        if max(abs(cand[0]), abs(cand[1])) > 1e5:
+            continue
+        uv_lo = cand
+        break
+    if uv_lo is None or uv_hi is None:
+        return None, -1.0, "far post did not project"
+    if not all(math.isfinite(v) for v in (*uv_lo, *uv_hi)):
+        return None, -1.0, "far post did not project"
+    sa = np.array(uv_lo, dtype=np.float64)
+    sb = np.array(uv_hi, dtype=np.float64)
+    src = sb - sa
+    if float(np.linalg.norm(src)) < 4.0:
+        return None, -1.0, "far post projection is too short"
+    if float(np.dot(src, dst)) <= 0.0:
+        return None, -1.0, "click BOTTOM of the post first, then TOP"
 
+    ang = math.atan2(dst[1], dst[0]) - math.atan2(src[1], src[0])
+    c, s = math.cos(ang), math.sin(ang)
+    rot = np.array([[c, -s], [s, c]], dtype=np.float64)
+    mid = 0.5 * (sa + sb)
+    sa_r = rot @ (sa - mid) + mid
+    sb_r = rot @ (sb - mid) + mid
 
-def lock_h_to_far_clicks(
-    clicks: ClickState,
-    pos_l: np.ndarray,
-    pos_r: np.ndarray,
-    h_angle: float,
-    v_angle: float,
-    focal_l: float,
-    focal_r: float,
-    img_w: int,
-    img_h: int,
-    img_w_r: int,
-    img_h_r: int,
-    baseline: float,
-    y0: float,
-    y1: float,
-) -> tuple[float, float]:
-    """
-    Sweep H-angle so the drawn far post sits on the latest FAR clicks.
-    Left click → right post; right click → left post.
-    """
-    half = baseline / 2.0
-    pt_l = clicks.far_l[-1] if clicks.far_l else None
-    pt_r = clicks.far_r[-1] if clicks.far_r else None
-    if pt_l is None and pt_r is None:
-        return h_angle, -1.0
+    def closest(a: np.ndarray, b: np.ndarray, p: np.ndarray) -> np.ndarray:
+        ab = b - a
+        denom = float(np.dot(ab, ab))
+        t = float(np.dot(p - a, ab)) / denom
+        return a + t * ab
 
-    lo = max(1.0, h_angle - 20.0)
-    hi = min(90.0, h_angle + 20.0)
-    best_h = h_angle
-    best_err = 1e9
-    step = 0.5
-    h = lo
-    while h <= hi + 1e-9:
-        P1 = make_proj_matrix(pos_l, +h, v_angle, focal_l, img_w, img_h)
-        P2 = make_proj_matrix(pos_r, -h, v_angle, focal_r, img_w_r, img_h_r)
-        err = 0.0
-        n = 0
-        if pt_l is not None:
-            err += point_to_post_px(P1, pt_l, +half, y0, y1)
-            n += 1
-        if pt_r is not None:
-            err += point_to_post_px(P2, pt_r, -half, y0, y1)
-            n += 1
-        mean = err / max(n, 1)
-        if mean < best_err:
-            best_err = mean
-            best_h = h
-        h += step
-    return best_h, best_err
+    shift = 0.5 * (
+        (bot - closest(sa_r, sb_r, bot)) + (top - closest(sa_r, sb_r, top))
+    )
+    # x' = rot @ (x - mid) + mid + shift
+    tcol = mid - rot @ mid + shift
+    affine = np.hstack([rot, tcol.reshape(2, 1)])
+    moved = float(np.linalg.norm(shift))
+    deg = math.degrees(ang)
+    return affine, moved, f"shift {shift[0]:+.0f},{shift[1]:+.0f}px  rot {deg:+.1f}°"
 
 
 def reproj_err_px(P: np.ndarray, xyz: np.ndarray, uv: tuple[float, float]) -> float:
@@ -900,13 +946,29 @@ def save_plane(
     img_h: int,
     clicks: ClickState,
     rotate_deg: int,
+    h_left: float | None = None,
+    h_right: float | None = None,
+    v_left: float | None = None,
+    v_right: float | None = None,
+    roll_l: float = 0.0,
+    roll_r: float = 0.0,
+    snap_l: np.ndarray | None = None,
+    snap_r: np.ndarray | None = None,
 ) -> None:
     PLANE_PATH.parent.mkdir(parents=True, exist_ok=True)
     payload = {
         "baseline_m": baseline_m,
         "cam_behind_post_m": behind_m,
         "h_angle_deg": h_angle,
+        "h_left_deg": h_left if h_left is not None else h_angle,
+        "h_right_deg": h_right if h_right is not None else -abs(h_angle),
         "v_angle_deg": v_angle,
+        "v_left_deg": v_left if v_left is not None else v_angle,
+        "v_right_deg": v_right if v_right is not None else v_angle,
+        "roll_left_deg": roll_l,
+        "roll_right_deg": roll_r,
+        "overlay_snap_left": None if snap_l is None else snap_l.tolist(),
+        "overlay_snap_right": None if snap_r is None else snap_r.tolist(),
         "extend_up_m": extend_up_m,
         "focal_px": focal_px,
         "image_width": img_w,
@@ -1025,6 +1087,8 @@ def main() -> int:
         source = "video"
 
     h_angle = float(args.h_angle)
+    h_left = float(h_angle)
+    h_right = -float(h_angle)
     v_angle = float(args.v_angle)
     extend_up = float(args.extend)
     baseline = float(args.baseline)
@@ -1039,6 +1103,8 @@ def main() -> int:
     if rotate_deg not in (0, 90, 270):
         rotate_deg = 90
     clicks = ClickState()
+    snap_l: np.ndarray | None = None
+    snap_r: np.ndarray | None = None
     ball_on = not bool(args.no_ball)
     show_labels = False
     paused = source != "live"
@@ -1164,7 +1230,7 @@ def main() -> int:
             f"{extra}"
             "Blue = in field (whole ball between posts).  Green = through + between.  "
             "Red = through but wide.  Need both cameras.\n"
-            "Click the visible FAR post then press K to lock the plane to it.\n"
+            "Click BOTTOM then TOP of the far post — overlay slides with the yellow line.\n"
         )
 
         xyz_l, xyz_r = cfg.camera_positions(baseline, behind)
@@ -1174,9 +1240,8 @@ def main() -> int:
         post_r = np.array([baseline / 2.0, 0.0, 0.0])
 
         def build_projs():
-            # Left looks across toward +X (far/right post); right toward −X
-            P1 = make_proj_matrix(pos_l, +h_angle, v_angle, focal_px, img_w, img_h)
-            P2 = make_proj_matrix(pos_r, -h_angle, v_angle, focal_r, img_w_r, img_h_r)
+            P1 = make_proj_matrix(pos_l, h_left, v_angle, focal_px, img_w, img_h)
+            P2 = make_proj_matrix(pos_r, h_right, v_angle, focal_r, img_w_r, img_h_r)
             return P1, P2
 
         P1, P2 = build_projs()
@@ -1236,11 +1301,11 @@ def main() -> int:
             y_vis = max(0.0, float(y_vis))
             draw_goal_plane(
                 disp_l, P1, baseline, extend_up, pos_l, pos_r, "L",
-                show_point_labels=show_labels, y_vis_min=y_vis,
+                show_point_labels=show_labels, y_vis_min=y_vis, affine=snap_l,
             )
             draw_goal_plane(
                 disp_r, P2, baseline, extend_up, pos_l, pos_r, "R",
-                show_point_labels=show_labels, y_vis_min=y_vis,
+                show_point_labels=show_labels, y_vis_min=y_vis, affine=snap_r,
             )
             click_dbg = clicks.draw_on(disp_l, disp_r, P1, P2, pos_l, pos_r)
 
@@ -1275,7 +1340,7 @@ def main() -> int:
             lines = [
                 f"L {src_l}  R {src_r}  |  posts {baseline:.2f}m  "
                 f"ball Ø{cfg.BALL_DIAMETER_M*100:.0f}cm  "
-                f"H{h_angle:.0f} V{v_angle:.0f}  visY≥{y_vis:.2f}m  "
+                f"HL{h_left:.0f} HR{h_right:.0f} V{v_angle:.0f}  visY≥{y_vis:.2f}m  "
                 f"{fps_ema:.0f}fps  {rotate_label(rotate_deg)}{src_note}",
             ]
             if ball_line:
@@ -1311,13 +1376,33 @@ def main() -> int:
                             if sx < split_x and split_x > 0:
                                 x = max(0, min(view_l.shape[1] - 1, int(sx * view_l.shape[1] / split_x)))
                                 y = max(0, min(view_l.shape[0] - 1, int(sy * view_l.shape[0] / pair_h)))
-                                clicks.add("L", (x, y))
+                                n = clicks.add("L", (x, y))
+                                if clicks.mode == "far" and n >= 2:
+                                    half = baseline / 2.0
+                                    aff, _moved, note = overlay_snap_to_clicks(
+                                        P1, clicks.far_l, +half, 0.0, extend_up,
+                                    )
+                                    if aff is None:
+                                        print(f"  Left snap skipped — {note}")
+                                    else:
+                                        snap_l = aff
+                                        print(f"  Left overlay moved with yellow post  {note}")
                             elif layout["src_w"] > split_x:
                                 lx = sx - split_x
                                 rw = layout["src_w"] - split_x
                                 x = max(0, min(view_r.shape[1] - 1, int(lx * view_r.shape[1] / rw)))
                                 y = max(0, min(view_r.shape[0] - 1, int(sy * view_r.shape[0] / pair_h)))
-                                clicks.add("R", (x, y))
+                                n = clicks.add("R", (x, y))
+                                if clicks.mode == "far" and n >= 2:
+                                    half = baseline / 2.0
+                                    aff, _moved, note = overlay_snap_to_clicks(
+                                        P2, clicks.far_r, -half, 0.0, extend_up,
+                                    )
+                                    if aff is None:
+                                        print(f"  Right snap skipped — {note}")
+                                    else:
+                                        snap_r = aff
+                                        print(f"  Right overlay moved with yellow post  {note}")
 
             if source == "video":
                 delay = 30 if paused else max(1, int(round(1000.0 / play_fps)))
@@ -1351,17 +1436,23 @@ def main() -> int:
             elif key in (ord("c"), ord("C")):
                 clicks.clear()
             elif key == ord("["):
-                h_angle = max(0.0, h_angle - 1.0)
-                print(f"  H_ANGLE → {h_angle:.1f}°")
+                h_left = max(1.0, h_left - 1.0)
+                h_right = min(-1.0, h_right + 1.0)
+                snap_l = snap_r = None
+                print(f"  H → L {h_left:.1f}°  R {h_right:.1f}°  (overlay snap cleared)")
             elif key == ord("]"):
-                h_angle = min(180.0, h_angle + 1.0)
-                print(f"  H_ANGLE → {h_angle:.1f}°")
+                h_left = min(120.0, h_left + 1.0)
+                h_right = max(-120.0, h_right - 1.0)
+                snap_l = snap_r = None
+                print(f"  H → L {h_left:.1f}°  R {h_right:.1f}°  (overlay snap cleared)")
             elif key == ord("-"):
                 v_angle = max(0.0, v_angle - 1.0)
-                print(f"  V_ANGLE → {v_angle:.1f}°")
+                snap_l = snap_r = None
+                print(f"  V_ANGLE → {v_angle:.1f}°  (overlay snap cleared)")
             elif key == ord("="):
                 v_angle = min(89.0, v_angle + 1.0)
-                print(f"  V_ANGLE → {v_angle:.1f}°")
+                snap_l = snap_r = None
+                print(f"  V_ANGLE → {v_angle:.1f}°  (overlay snap cleared)")
             elif key == ord(","):
                 extend_up = max(1.0, extend_up - 0.5)
                 print(f"  extend_up → {extend_up:.1f} m")
@@ -1369,23 +1460,36 @@ def main() -> int:
                 extend_up = min(20.0, extend_up + 0.5)
                 print(f"  extend_up → {extend_up:.1f} m")
             elif key in (ord("k"), ord("K")):
-                if not clicks.far_l and not clicks.far_r:
-                    print("  K: click the FAR post in one or both views first (F mode)")
-                else:
-                    new_h, err = lock_h_to_far_clicks(
-                        clicks, pos_l, pos_r, h_angle, v_angle,
-                        focal_px, focal_r, img_w, img_h, img_w_r, img_h_r,
-                        baseline, y_vis, extend_up,
+                half = baseline / 2.0
+                did = False
+                if len(clicks.far_l) >= 2:
+                    aff, _moved, note = overlay_snap_to_clicks(
+                        P1, clicks.far_l, +half, 0.0, extend_up,
                     )
-                    h_angle = new_h
-                    print(
-                        f"  Locked H → {h_angle:.1f}°  "
-                        f"(far-post click err {err:.0f}px). R resets."
+                    if aff is None:
+                        print(f"  Left snap skipped — {note}")
+                    else:
+                        snap_l = aff
+                        print(f"  Left overlay moved with yellow post  {note}")
+                    did = True
+                if len(clicks.far_r) >= 2:
+                    aff, _moved, note = overlay_snap_to_clicks(
+                        P2, clicks.far_r, -half, 0.0, extend_up,
                     )
+                    if aff is None:
+                        print(f"  Right snap skipped — {note}")
+                    else:
+                        snap_r = aff
+                        print(f"  Right overlay moved with yellow post  {note}")
+                    did = True
+                if not did:
+                    print("  Click BOTTOM then TOP of the far post, then K if needed")
             elif key in (ord("r"), ord("R")):
-                h_angle = float(cfg.H_ANGLE_DEG)
+                h_left = float(cfg.H_ANGLE_DEG)
+                h_right = -float(cfg.H_ANGLE_DEG)
                 v_angle = float(cfg.V_ANGLE_DEG)
-                print(f"  Reset angles → H={h_angle:.1f} V={v_angle:.1f}")
+                snap_l = snap_r = None
+                print(f"  Reset overlay → HL={h_left:.1f} HR={h_right:.1f} V={v_angle:.1f}")
             elif key in (ord("b"), ord("B")):
                 ball_on = not ball_on
                 ball_dets = None
@@ -1398,19 +1502,24 @@ def main() -> int:
             elif key in (ord("o"), ord("O")):
                 rotate_deg = {90: 270, 270: 0, 0: 90}.get(rotate_deg, 90)
                 clicks.clear()
+                snap_l = snap_r = None
                 ball_dets = None
                 print(f"  {rotate_label(rotate_deg)}  (clicks cleared)")
             elif key in (ord("s"), ord("S")):
                 save_plane(
-                    baseline, behind, h_angle, v_angle, extend_up,
+                    baseline, behind, abs(h_left), v_angle, extend_up,
                     focal_px, img_w, img_h, clicks, rotate_deg,
+                    h_left=h_left, h_right=h_right,
+                    v_left=v_angle, v_right=v_angle,
+                    snap_l=snap_l, snap_r=snap_r,
                 )
             elif key in (ord("l"), ord("L")):
                 data = load_plane()
                 if data is None:
                     print("  No plane.json found")
                 else:
-                    h_angle = float(data.get("h_angle_deg", h_angle))
+                    h_left = float(data.get("h_left_deg", data.get("h_angle_deg", h_left)))
+                    h_right = float(data.get("h_right_deg", -abs(h_left)))
                     v_angle = float(data.get("v_angle_deg", v_angle))
                     extend_up = float(data.get("extend_up_m", extend_up))
                     behind = float(data.get("cam_behind_post_m", behind))
@@ -1422,9 +1531,13 @@ def main() -> int:
                         rotate_deg = rd
                         ball_dets = None
                     clicks.load_dict(data.get("clicks", {}))
+                    sl = data.get("overlay_snap_left")
+                    sr = data.get("overlay_snap_right")
+                    snap_l = None if sl is None else np.array(sl, dtype=np.float64)
+                    snap_r = None if sr is None else np.array(sr, dtype=np.float64)
                     print(
-                        f"  Loaded {PLANE_PATH}  H={h_angle:.1f} V={v_angle:.1f}  "
-                        f"behind={behind:.3f} m  {rotate_label(rotate_deg)}"
+                        f"  Loaded {PLANE_PATH}  HL={h_left:.1f} HR={h_right:.1f} "
+                        f"V={v_angle:.1f}  behind={behind:.3f} m  {rotate_label(rotate_deg)}"
                     )
 
     except RuntimeError as e:

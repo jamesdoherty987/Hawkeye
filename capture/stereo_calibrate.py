@@ -114,6 +114,7 @@ def make_proj_matrix(
     focal_px: float,
     img_w: int,
     img_h: int,
+    roll_deg: float = 0.0,
 ) -> np.ndarray:
     """
     Build a 3×4 OpenCV projection matrix P = K @ [R | t] for a camera
@@ -155,6 +156,14 @@ def make_proj_matrix(
     # Camera Y-axis (downward in image) = cam_x × cam_z gives upward, negate for down
     cam_y_up = np.cross(cam_x, cam_z)
     cam_y_down = -cam_y_up / np.linalg.norm(cam_y_up)
+
+    if abs(roll_deg) > 1e-6:
+        r = math.radians(roll_deg)
+        c, s = math.cos(r), math.sin(r)
+        cam_x2 = c * cam_x + s * cam_y_down
+        cam_y2 = -s * cam_x + c * cam_y_down
+        cam_x = cam_x2 / np.linalg.norm(cam_x2)
+        cam_y_down = cam_y2 / np.linalg.norm(cam_y2)
 
     # Camera-to-world rotation (columns = camera axes in world)
     R_c2w = np.column_stack([cam_x, cam_y_down, cam_z])
