@@ -1,0 +1,76 @@
+{
+  "baseline_m": 1.0,
+  "cam_behind_post_m": 0.1,
+  "h_angle_deg": 90.0,
+  "h_left_deg": 90.0,
+  "h_right_deg": -90.0,
+  "v_angle_deg": 55.0,
+  "v_left_deg": 55.0,
+  "v_right_deg": 55.0,
+  "roll_left_deg": 0.0,
+  "roll_right_deg": 0.0,
+  "overlay_snap_left": [
+    [
+      0.9769797490982949,
+      -0.21333206475312788,
+      146.11592257726954
+    ],
+    [
+      0.21333206475312788,
+      0.9769797490982949,
+      -19.29934283795501
+    ]
+  ],
+  "overlay_snap_right": [
+    [
+      0.9948608204784368,
+      -0.10125190307827074,
+      100.3896754972192
+    ],
+    [
+      0.10125190307827074,
+      0.9948608204784368,
+      -26.838094171331363
+    ]
+  ],
+  "extend_up_m": 4.0,
+  "focal_px": 548.0341844158828,
+  "image_width": 480,
+  "image_height": 640,
+  "cameras_sideways": true,
+  "rotate_deg": 90,
+  "plane": {
+    "origin": "midpoint of crossbar on the goal plane",
+    "equation": "Z = 0 (goal plane / posts / crossbar)",
+    "cameras_z": -0.1,
+    "left_post_x": -0.5,
+    "right_post_x": 0.5,
+    "crossbar_y": 0.0,
+    "note": "Y > 0 is above the bar; Z > 0 is into the field; cameras at Z = \u2212behind"
+  },
+  "clicks": {
+    "far_left": [
+      [
+        190,
+        621
+      ],
+      [
+        278,
+        349
+      ]
+    ],
+    "far_right": [
+      [
+        337,
+        612
+      ],
+      [
+        338,
+        327
+      ]
+    ],
+    "near_left": [],
+    "near_right": []
+  },
+  "camera": "B0332 + LN013 NOIR"
+}

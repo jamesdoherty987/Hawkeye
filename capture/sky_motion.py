@@ -160,7 +160,10 @@ class SkyMotionDetector:
         self._frame_count += 1
 
         ready = self._frame_count >= self.warmup_frames
-        blobs = self._extract_blobs(mask) if ready else []
+        # Frame-diff works from the 2nd frame — return blobs immediately so
+        # callers can fire YOLO on the first motion frame (no warmup wait).
+        # `ready` still means the background model has finished warming up.
+        blobs = self._extract_blobs(mask) if self._frame_count >= 2 else []
 
         return MotionResult(
             blobs=blobs,

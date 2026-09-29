@@ -13,9 +13,24 @@ Then test with:
     --video-left  exports/stereo/pairs/pair_..._left.mp4 \\
     --video-right exports/stereo/pairs/pair_..._right.mp4
 
+Left / right
+────────────
+  From BEHIND the goal, facing the field (keeper’s left / right).
+  LEFT panel  = camera on the left post
+  RIGHT panel = camera on the right post
+  USB indexes (--left / --right) are arbitrary — wave at one post and swap
+  the numbers if the wrong panel moves.
+
+Orientation (sideways mount)
+────────────────────────────
+  After rotate in plane-calib: sky / above-bar toward the TOP of the image,
+  looking across the goal at the FAR post. Driver often outputs 640×480
+  landscape; that is fine to record — plane-calib rotates to portrait.
+
 Controls
 ────────
   R     = start / stop recording (each stop saves a new left+right pair)
+  O     = cycle preview rotate 90° / 270° / off (N should point at the sky)
   Q/ESC = quit (stops and saves if currently recording)
 
 Usage
@@ -37,6 +52,7 @@ import cv2
 import numpy as np
 
 from auto_exposure import try_set
+import stereo_config as cfg
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -44,6 +60,32 @@ OUT_DIR = PROJECT_ROOT / "exports" / "stereo" / "pairs"
 VIDEO_CODEC = "mp4v"
 WINDOW = "Hawkeye Dual Record — R record | Q quit"
 PLACEHOLDER_FPS = 30.0  # rewritten to measured fps on stop
+
+
+def orient_preview(frame: np.ndarray, rotate_deg: int) -> np.ndarray:
+    """Match plane-calib: landscape → portrait so image TOP = sky / N."""
+    if not cfg.CAMERAS_SIDEWAYS or rotate_deg == 0:
+        return frame
+    h, w = frame.shape[:2]
+    if h >= w:
+        return frame
+    if rotate_deg == 270:
+        return cv2.rotate(frame, cv2.ROTATE_90_COUNTERCLOCKWISE)
+    return cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)
+
+
+def draw_north_up(img: np.ndarray) -> None:
+    """N + arrow at TOP = world up / sky when the mount rotate is correct."""
+    h, w = img.shape[:2]
+    cx = w // 2
+    cv2.arrowedLine(img, (cx, 40), (cx, 12), (0, 255, 255), 2, cv2.LINE_AA, tipLength=0.35)
+    cv2.putText(img, "N", (cx - 12, 64), cv2.FONT_HERSHEY_SIMPLEX, 0.85, (0, 255, 255), 2, cv2.LINE_AA)
+    cv2.putText(img, "up/sky", (cx - 32, 84), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (180, 255, 255), 1, cv2.LINE_AA)
+    if h < w:
+        cv2.putText(
+            img, "landscape — press O if sky is sideways",
+            (8, h - 12), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1, cv2.LINE_AA,
+        )
 
 
 def _backends() -> list[tuple[str, int]]:
@@ -131,21 +173,43 @@ def rewrite_with_fps(path: Path, fps: float) -> None:
     tmp.replace(path)
 
 
-def paint_preview(frame_l: np.ndarray, frame_r: np.ndarray, recording: bool, n_frames: int) -> np.ndarray:
-    h = max(frame_l.shape[0], frame_r.shape[0])
-    left = fit_height(frame_l, h)
-    right = fit_height(frame_r, h)
-    for img, title in ((left, "LEFT"), (right, "RIGHT")):
-        cv2.putText(img, title, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
+def paint_preview(
+    frame_l: np.ndarray,
+    frame_r: np.ndarray,
+    recording: bool,
+    n_frames: int,
+    idx_l: int,
+    idx_r: int,
+    rotate_deg: int,
+) -> np.ndarray:
+    # Preview only (saved files stay raw). Rotate so N/up is at the top edge.
+    left = orient_preview(frame_l, rotate_deg).copy()
+    right = orient_preview(frame_r, rotate_deg).copy()
+    h = max(left.shape[0], right.shape[0])
+    left = fit_height(left, h)
+    right = fit_height(right, h)
+    labels = (
+        (left, f"LEFT cam {idx_l}", "behind goal → field"),
+        (right, f"RIGHT cam {idx_r}", "behind goal → field"),
+    )
+    for img, title, sub in labels:
+        draw_north_up(img)
+        cv2.putText(img, title, (12, 28), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2, cv2.LINE_AA)
+        cv2.putText(img, sub, (12, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.42, (180, 255, 255), 1, cv2.LINE_AA)
+        fh, fw = img.shape[:2]
+        cv2.putText(
+            img, f"{fw}x{fh}", (12, fh - 12),
+            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA,
+        )
     combo = np.hstack([left, right])
     status = "● REC" if recording else "IDLE"
     col = (0, 0, 255) if recording else (0, 200, 50)
     cv2.putText(
         combo,
-        f"{status}  frames={n_frames}  |  R = record  Q = quit",
+        f"{status}  frames={n_frames}  |  R record  O rotate  Q quit  |  N = up/sky",
         (12, combo.shape[0] - 16),
         cv2.FONT_HERSHEY_SIMPLEX,
-        0.65,
+        0.55,
         col,
         2,
         cv2.LINE_AA,
@@ -192,6 +256,9 @@ def main() -> int:
     n_frames = 0
     t_start = 0.0
     pairs_saved = 0
+    rotate_deg = int(cfg.SIDEWAYS_ROTATE_DEG) if cfg.CAMERAS_SIDEWAYS else 0
+    if rotate_deg not in (0, 90, 270):
+        rotate_deg = 90
 
     def stop_recording() -> None:
         nonlocal writer_l, writer_r, path_l, path_r, size_l, size_r
@@ -274,10 +341,19 @@ def main() -> int:
             cap_l.release()
             cap_l = None
             raise
-        print(f"\nPreview only until you press R. Files go to: {out_dir}\n")
+        print(
+            f"\nPreview only until you press R. Files go to: {out_dir}\n"
+            "LEFT / RIGHT = standing BEHIND the goal, looking into the field "
+            "(keeper’s left / right).\n"
+            "Wave at the left post: the LEFT panel should move. If the RIGHT "
+            "panel moves instead, swap --left / --right.\n"
+            "Frames are often 640×480 landscape from Windows; preview rotates so "
+            "N is at the TOP (= sky / up). Press O to cycle rotate if sky is sideways. "
+            "Saved MP4s stay raw (unrotated).\n"
+        )
 
         cv2.namedWindow(WINDOW, cv2.WINDOW_NORMAL)
-        cv2.resizeWindow(WINDOW, 1280, 520)
+        cv2.resizeWindow(WINDOW, 900, 900)
 
         while True:
             ok_l, frame_l = read_cam(cap_l)
@@ -301,13 +377,18 @@ def main() -> int:
                 writer_r.write(frame_r)
                 n_frames += 1
 
-            preview = paint_preview(frame_l, frame_r, recording, n_frames)
+            preview = paint_preview(
+                frame_l, frame_r, recording, n_frames, args.left, args.right, rotate_deg,
+            )
             cv2.imshow(WINDOW, preview)
             key = cv2.waitKey(1) & 0xFF
 
             if key in (ord("q"), ord("Q"), 27):
                 stop_recording()
                 break
+            if key in (ord("o"), ord("O")):
+                rotate_deg = {90: 270, 270: 0, 0: 90}.get(rotate_deg, 90)
+                print(f"  Preview rotate → {rotate_deg}°  (N should point at sky)")
             if key in (ord("r"), ord("R")):
                 if recording:
                     stop_recording()

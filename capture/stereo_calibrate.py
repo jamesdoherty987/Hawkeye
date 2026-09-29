@@ -153,9 +153,11 @@ def make_proj_matrix(
     else:
         cam_x /= norm
 
-    # Camera Y-axis (downward in image) = cam_x × cam_z gives upward, negate for down
-    cam_y_up = np.cross(cam_x, cam_z)
-    cam_y_down = -cam_y_up / np.linalg.norm(cam_y_up)
+    # OpenCV camera Y points down in the image. For a level camera looking
+    # forward, that axis is world-down so higher world-Y lands higher on screen.
+    # (The old extra negate flipped the plane upside-down / sideways.)
+    cam_y_down = np.cross(cam_x, cam_z)
+    cam_y_down /= np.linalg.norm(cam_y_down)
 
     if abs(roll_deg) > 1e-6:
         r = math.radians(roll_deg)

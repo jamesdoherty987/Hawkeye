@@ -32,6 +32,8 @@ Controls
   , / . = decrease / increase plane height extension (metres)
   R     = reset angles to stereo_config defaults
   B     = toggle ball detection (on by default)
+          Motion wakes YOLO on the same frame (no delay). Near the plane /
+          fast ball → every frame; deep field → every few frames; idle → off.
           BLUE flash = ball seen, still in front of the plane
           GREEN      = ball has gone THROUGH between the posts
           RED        = ball has gone THROUGH but wide of the posts
@@ -77,6 +79,7 @@ from ultralytics import YOLO
 
 from auto_exposure import try_set
 import stereo_config as cfg
+from sky_motion import SkyMotionDetector
 from stereo_calibrate import (
     make_proj_matrix,
     project_world,
@@ -91,7 +94,7 @@ STILL_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
 
 COCO_MODEL = "yolov8n.pt"
 SPORTS_BALL_CLASS = 32
-IMAGE_SIZE = 640
+IMAGE_SIZE = 416              # live default; override with --imgsz
 CONFIDENCE = 0.30
 WINDOW = "Hawkeye Plane"
 
@@ -99,6 +102,11 @@ PLANE_CROSS_M = 0.05
 POST_MARGIN_M = 0.02          # extra width beyond ±baseline/2 still called "between"
 REPROJ_MAX_PX = 40.0          # reject 3D if it doesn't land on both detections
 CALL_LATCH_S = 1.2
+NEAR_PLANE_Z_M = 1.25         # |Z| below this → YOLO every frame
+FAST_SPEED_M_S = 4.0          # 3D speed above this → YOLO every frame
+IDLE_YOLO_STRIDE = 3          # deep-field / coasting: run every N frames
+ARM_AFTER_MOTION = 20         # keep detector hot this many frames after motion
+STALE_DET_FRAMES = 12         # drop held boxes if YOLO hasn't run this long
 COL_GRID = (80, 200, 80)
 COL_POST = (0, 255, 255)
 COL_BAR = (0, 180, 255)
@@ -252,10 +260,21 @@ def rotate_label(deg: int) -> str:
     return "rotate=90 CW"
 
 
-def draw_camera_hud(img: np.ndarray, which_cam: str, rotate_deg: int) -> None:
+def draw_camera_hud(
+    img: np.ndarray,
+    which_cam: str,
+    rotate_deg: int,
+    show_north: bool = True,
+) -> None:
+    """L/R badge; optional N at TOP (sky) when aligning / checking rotate."""
     col = COL_POST if which_cam == "L" else COL_CLICK_NEAR
     put_label(img, "L" if which_cam == "L" else "R", (8, 26), col, 0.75, 2)
     h, w = img.shape[:2]
+    if show_north:
+        cx = w // 2
+        cv2.arrowedLine(img, (cx, 36), (cx, 10), (0, 255, 255), 2, cv2.LINE_AA, tipLength=0.35)
+        put_label(img, "N", (cx - 10, 58), (0, 255, 255), 0.7, 2)
+        put_label(img, "up/sky", (cx - 28, 76), (180, 255, 255), 0.4, 1)
     if h < w:
         put_label(img, "O rotate", (8, h - 14), (0, 0, 255), 0.5, 2)
 
@@ -409,15 +428,18 @@ def draw_goal_plane(
     show_point_labels: bool = True,
     y_vis_min: float = 0.0,
     affine: np.ndarray | None = None,
+    compact: bool = False,
 ) -> None:
     """Draw posts, orange crossbar at Y=0, and grid. Optional 2D snap affine."""
     half = baseline_m / 2.0
     y1 = max(0.4, float(extend_up_m))
+    if compact:
+        grid_nx, grid_ny = 3, 4
 
     # Orange = real crossbar (Y = 0). Yellow posts run from the bar upward.
     draw_line_world(
         img, P, np.array([-half, 0.0, 0.0]), np.array([half, 0.0, 0.0]),
-        COL_BAR, 3, affine=affine,
+        COL_BAR, 3 if not compact else 2, affine=affine,
     )
     draw_line_world(
         img, P, np.array([-half, 0.0, 0.0]), np.array([-half, y1, 0.0]),
@@ -427,22 +449,26 @@ def draw_goal_plane(
         img, P, np.array([half, 0.0, 0.0]), np.array([half, y1, 0.0]),
         COL_POST, 3, affine=affine,
     )
-    draw_line_world(
-        img, P, np.array([-half, y1, 0.0]), np.array([half, y1, 0.0]),
-        COL_GRID, 1, affine=affine,
-    )
+    if not compact:
+        draw_line_world(
+            img, P, np.array([-half, y1, 0.0]), np.array([half, y1, 0.0]),
+            COL_GRID, 1, affine=affine,
+        )
 
     for i in range(grid_nx + 1):
         x = -half + (baseline_m * i / grid_nx)
         a = np.array([x, 0.0, 0.0])
         b = np.array([x, y1, 0.0])
-        draw_line_world(img, P, a, b, COL_GRID, 1, n_seg=16, affine=affine)
+        draw_line_world(img, P, a, b, COL_GRID, 1, n_seg=12 if compact else 16, affine=affine)
 
     for j in range(1, grid_ny + 1):
         y = y1 * j / grid_ny
         a = np.array([-half, y, 0.0])
         b = np.array([half, y, 0.0])
-        draw_line_world(img, P, a, b, COL_GRID, 1, n_seg=16, affine=affine)
+        draw_line_world(img, P, a, b, COL_GRID, 1, n_seg=12 if compact else 16, affine=affine)
+
+    if compact:
+        return
 
     y_note = max(0.0, float(y_vis_min))
     uv = project_safe(P, np.array([0.0, y_note, 0.0]), affine)
@@ -660,8 +686,15 @@ def load_ball_model(model_str: str) -> tuple[YOLO, list[int] | None]:
     return YOLO(str(path)), ([SPORTS_BALL_CLASS] if is_coco else None)
 
 
-def detect_both(model: YOLO, frame_l, frame_r, conf: float, classes: list[int] | None):
-    kw: dict = dict(conf=conf, imgsz=IMAGE_SIZE, verbose=False)
+def detect_both(
+    model: YOLO,
+    frame_l,
+    frame_r,
+    conf: float,
+    classes: list[int] | None,
+    imgsz: int = IMAGE_SIZE,
+):
+    kw: dict = dict(conf=conf, imgsz=int(imgsz), verbose=False)
     if classes:
         kw["classes"] = classes
     results = model.predict([frame_l, frame_r], **kw)
@@ -678,6 +711,128 @@ def detect_both(model: YOLO, frame_l, frame_r, conf: float, classes: list[int] |
         return cx, cy, c, xyxy
 
     return best(results[0]), best(results[1])
+
+
+class BallDetectScheduler:
+    """
+    Motion-gated YOLO with adaptive stride.
+
+    - Idle (no motion, no track): skip YOLO entirely.
+    - First motion frame: run YOLO immediately (no delay).
+    - Near plane or moving fast: every frame.
+    - Deep in field / coasting: every idle_stride frames; reuse last boxes.
+    """
+
+    def __init__(self, idle_stride: int = IDLE_YOLO_STRIDE) -> None:
+        self.idle_stride = max(1, int(idle_stride))
+        self.frame_i = 0
+        self.since_yolo = 10**9
+        self.last_dets: tuple = (None, None)
+        self.last_xyz: np.ndarray | None = None
+        self.prev_xyz: np.ndarray | None = None
+        self.last_xyz_t: float | None = None
+        self.armed_until = 0
+        self.last_mode = "idle"
+        self.yolo_runs = 0
+        self._last_speed = 0.0
+
+    def reset(self) -> None:
+        self.frame_i = 0
+        self.since_yolo = 10**9
+        self.last_dets = (None, None)
+        self.last_xyz = None
+        self.prev_xyz = None
+        self.last_xyz_t = None
+        self.armed_until = 0
+        self.last_mode = "idle"
+        self.yolo_runs = 0
+        self._last_speed = 0.0
+
+    def should_run(self, has_motion: bool, now: float, force: bool = False) -> tuple[bool, str]:
+        self.frame_i += 1
+        self.since_yolo += 1
+        if force:
+            self.last_mode = "force"
+            return True, self.last_mode
+
+        if has_motion:
+            self.armed_until = self.frame_i + ARM_AFTER_MOTION
+            self.last_mode = "motion"
+            return True, self.last_mode
+
+        near = False
+        fast = getattr(self, "_last_speed", 0.0) >= FAST_SPEED_M_S
+        if self.last_xyz is not None:
+            near = abs(float(self.last_xyz[2])) <= NEAR_PLANE_Z_M
+
+        if near or fast:
+            self.armed_until = max(self.armed_until, self.frame_i + ARM_AFTER_MOTION)
+            self.last_mode = "near" if near else "fast"
+            return True, self.last_mode
+
+        if self.frame_i <= self.armed_until and self.last_xyz is not None:
+            self.last_mode = "coast"
+            return self.since_yolo >= self.idle_stride, self.last_mode
+
+        if self.frame_i <= self.armed_until:
+            # Motion recently but no 3D yet — keep scanning every frame briefly
+            self.last_mode = "search"
+            return True, self.last_mode
+
+        self.last_mode = "idle"
+        return False, self.last_mode
+
+    def note_yolo(self, dets: tuple, now: float) -> None:
+        self.last_dets = dets
+        self.since_yolo = 0
+        self.yolo_runs += 1
+
+    def note_track(self, xyz: np.ndarray | None, now: float) -> None:
+        if xyz is None:
+            if self.since_yolo >= STALE_DET_FRAMES:
+                self.last_xyz = None
+                self.prev_xyz = None
+                self.last_xyz_t = None
+                self._last_speed = 0.0
+            return
+        if self.last_xyz is not None and self.last_xyz_t is not None:
+            dt = max(now - self.last_xyz_t, 1e-3)
+            self._last_speed = float(np.linalg.norm(xyz - self.last_xyz) / dt)
+            self.prev_xyz = self.last_xyz.copy()
+        else:
+            self._last_speed = 0.0
+        self.last_xyz = np.asarray(xyz, dtype=np.float64).reshape(3).copy()
+        self.last_xyz_t = now
+        self.armed_until = max(self.armed_until, self.frame_i + ARM_AFTER_MOTION)
+
+    def held_dets(self) -> tuple:
+        if self.since_yolo > STALE_DET_FRAMES:
+            return (None, None)
+        return self.last_dets
+
+    def status(self) -> str:
+        return f"yolo={self.last_mode} runs={self.yolo_runs}"
+
+
+def estimate_ball_xyz(
+    det_l,
+    det_r,
+    P1: np.ndarray,
+    P2: np.ndarray,
+    pos_l: np.ndarray,
+    pos_r: np.ndarray,
+) -> np.ndarray | None:
+    if det_l is None or det_r is None:
+        return None
+    pt_l, pt_r, _c, _r = calib_centres_from_dets(det_l, det_r, pos_l, pos_r, P1, P2)
+    xyz = triangulate_3d(P1, P2, pt_l, pt_r)
+    if xyz is None:
+        return None
+    if reproj_err_px(P1, xyz, pt_l) > REPROJ_MAX_PX:
+        return None
+    if reproj_err_px(P2, xyz, pt_r) > REPROJ_MAX_PX:
+        return None
+    return xyz
 
 
 def plane_side_label(z: float, eps: float = PLANE_CROSS_M) -> str:
@@ -933,6 +1088,33 @@ def paint_ball_pair(
     return line, call
 
 
+def compact_ball_status(ball_line: str, ball_call: str, yolo_mode: str = "") -> str:
+    """One short status line for the live HUD."""
+    _, banner, _ = call_style(ball_call)
+    if banner:
+        core = banner
+    elif "need both" in ball_line:
+        core = "1-cam"
+    elif "ignore" in ball_line or "mismatch" in ball_line:
+        core = "reject"
+    elif "3D failed" in ball_line:
+        core = "no-3D"
+    elif ball_line.startswith("dbg"):
+        # Pull Z if present
+        zbit = ""
+        if "Z=" in ball_line:
+            try:
+                zbit = ball_line.split("Z=")[1].split()[0]
+                zbit = f"Z{zbit}"
+            except (IndexError, ValueError):
+                zbit = "track"
+        core = zbit or "track"
+    else:
+        core = "—"
+    mode = f" · {yolo_mode}" if yolo_mode else ""
+    return f"{core}{mode}"
+
+
 # ─── Save / load ─────────────────────────────────────────────────────────────
 
 def save_plane(
@@ -1053,7 +1235,19 @@ def main() -> int:
         help="Ball detector. Default: models/football_yolov8n.pt if present, else yolov8n.pt",
     )
     parser.add_argument("--conf", type=float, default=CONFIDENCE)
+    parser.add_argument(
+        "--imgsz", type=int, default=IMAGE_SIZE,
+        help=f"YOLO inference size (default {IMAGE_SIZE}; try 320 for more FPS)",
+    )
+    parser.add_argument(
+        "--yolo-stride", type=int, default=IDLE_YOLO_STRIDE,
+        help="When ball is deep in field, run YOLO every N frames (default 3)",
+    )
     parser.add_argument("--no-ball", action="store_true", help="Start with ball detection off (B toggles)")
+    parser.add_argument(
+        "--no-motion-gate", action="store_true",
+        help="Always consider the scene 'moving' (YOLO scheduling only by near/fast/stride)",
+    )
     parser.add_argument("--list", action="store_true")
     args = parser.parse_args()
 
@@ -1110,7 +1304,12 @@ def main() -> int:
     paused = source != "live"
     model: YOLO | None = None
     ball_classes: list[int] | None = None
-    ball_dets: tuple | None = None
+    ball_dets: tuple = (None, None)
+    ball_sched = BallDetectScheduler(idle_stride=int(args.yolo_stride))
+    motion_l = SkyMotionDetector(warmup_frames=8)
+    motion_r = SkyMotionDetector(warmup_frames=8)
+    yolo_imgsz = max(160, int(args.imgsz))
+    motion_gate = not bool(args.no_motion_gate)
     ball_latch: dict = {"prev_z": None, "latch": None, "latch_until": 0.0}
     panel_split_x = 0
     frame_i = 0
@@ -1231,6 +1430,9 @@ def main() -> int:
             "Blue = in field (whole ball between posts).  Green = through + between.  "
             "Red = through but wide.  Need both cameras.\n"
             "Click BOTTOM then TOP of the far post — overlay slides with the yellow line.\n"
+            f"Ball YOLO: motion-wake (same frame), near-plane every frame, "
+            f"else every {ball_sched.idle_stride} · imgsz={yolo_imgsz}"
+            f"{'' if motion_gate else ' · motion-gate OFF'}.\n"
         )
 
         xyz_l, xyz_r = cfg.camera_positions(baseline, behind)
@@ -1263,13 +1465,17 @@ def main() -> int:
                     seek_videos(cap_l, cap_r, 0, video_n)
                     ok_l, next_l = read_cam(cap_l)
                     ok_r, next_r = read_cam(cap_r)
-                    ball_dets = None
+                    ball_dets = (None, None)
+                    ball_sched.reset()
+                    motion_l.reset()
+                    motion_r.reset()
                 if not ok_l or next_l is None or not ok_r or next_r is None:
                     time.sleep(0.02)
                     continue
                 frame_l, frame_r = next_l, next_r
                 if source == "live" or not paused:
-                    ball_dets = None
+                    # New frame pair — scheduler decides whether to re-run YOLO
+                    pass
 
             if frame_l is None or frame_r is None:
                 time.sleep(0.02)
@@ -1314,14 +1520,41 @@ def main() -> int:
             if ball_on:
                 if model is None:
                     model, ball_classes = load_ball_model(args.model or default_ball_model())
-                if ball_dets is None:
-                    ball_dets = detect_both(
-                        model, view_l, view_r, args.conf, ball_classes,
-                    )
+                # Still: one YOLO. Video pause: freeze last dets. Live/play: schedule.
+                do_infer = True
+                if source == "still":
+                    do_infer = ball_sched.yolo_runs == 0
+                elif source == "video" and paused:
+                    do_infer = False
+                if do_infer:
+                    mr_l = motion_l.process(view_l)
+                    mr_r = motion_r.process(view_r)
+                    has_motion = (not motion_gate) or bool(mr_l.blobs) or bool(mr_r.blobs)
+                    force = source == "still"
+                    run_yolo, _yolo_mode = ball_sched.should_run(has_motion, now, force=force)
+                    if run_yolo:
+                        ball_dets = detect_both(
+                            model, view_l, view_r, args.conf, ball_classes, imgsz=yolo_imgsz,
+                        )
+                        ball_sched.note_yolo(ball_dets, now)
+                        xyz = estimate_ball_xyz(
+                            ball_dets[0], ball_dets[1], P1, P2, pos_l, pos_r,
+                        )
+                        ball_sched.note_track(xyz, now)
+                    else:
+                        ball_dets = ball_sched.held_dets()
+                        if ball_sched.last_mode == "idle":
+                            ball_dets = (None, None)
                 ball_line, ball_call = paint_ball_pair(
                     disp_l, disp_r, ball_dets[0], ball_dets[1],
                     P1, P2, pos_l, pos_r, baseline, now, ball_latch,
                 )
+                if ball_line:
+                    ball_line = f"{ball_line}  {ball_sched.status()}"
+                else:
+                    ball_line = f"dbg  {ball_sched.status()}"
+            else:
+                ball_dets = (None, None)
 
             draw_camera_hud(disp_l, "L", rotate_deg)
             draw_camera_hud(disp_r, "R", rotate_deg)
@@ -1425,7 +1658,10 @@ def main() -> int:
                 target = current - step if key in (ord("a"), ord("A")) else current + step
                 seek_videos(cap_l, cap_r, target, video_n)
                 frame_l = frame_r = None
-                ball_dets = None
+                ball_dets = (None, None)
+                ball_sched.reset()
+                motion_l.reset()
+                motion_r.reset()
                 print(f"  Seek → frame {max(0, min(target, max(video_n - 1, 0)))}/{video_n}")
             elif key in (ord("f"), ord("F")):
                 clicks.mode = "far"
@@ -1492,7 +1728,10 @@ def main() -> int:
                 print(f"  Reset overlay → HL={h_left:.1f} HR={h_right:.1f} V={v_angle:.1f}")
             elif key in (ord("b"), ord("B")):
                 ball_on = not ball_on
-                ball_dets = None
+                ball_dets = (None, None)
+                ball_sched.reset()
+                motion_l.reset()
+                motion_r.reset()
                 ball_latch["prev_z"] = None
                 ball_latch["latch"] = None
                 print(f"  Ball detection {'ON' if ball_on else 'OFF'}")
@@ -1503,7 +1742,10 @@ def main() -> int:
                 rotate_deg = {90: 270, 270: 0, 0: 90}.get(rotate_deg, 90)
                 clicks.clear()
                 snap_l = snap_r = None
-                ball_dets = None
+                ball_dets = (None, None)
+                ball_sched.reset()
+                motion_l.reset()
+                motion_r.reset()
                 print(f"  {rotate_label(rotate_deg)}  (clicks cleared)")
             elif key in (ord("s"), ord("S")):
                 save_plane(
@@ -1529,7 +1771,10 @@ def main() -> int:
                     rd = int(data.get("rotate_deg", rotate_deg))
                     if rd in (0, 90, 270) and rd != rotate_deg:
                         rotate_deg = rd
-                        ball_dets = None
+                        ball_dets = (None, None)
+                        ball_sched.reset()
+                        motion_l.reset()
+                        motion_r.reset()
                     clicks.load_dict(data.get("clicks", {}))
                     sl = data.get("overlay_snap_left")
                     sr = data.get("overlay_snap_right")
